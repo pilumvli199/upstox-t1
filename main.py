@@ -777,7 +777,7 @@ class AIAnalyzer:
                 support_arrow = "↑" if support_change > 0 else "↓" if support_change < 0 else "→"
                 
                 prev
- _oi_text = f"""**PREVIOUS OI DATA ({comparison_period}):**
+_oi_text = f"""**PREVIOUS OI DATA ({comparison_period}):**
 - Resistance: {prev_oi.resistance_strike} → {current_oi.resistance_strike} {resistance_arrow} (Change: {resistance_change})
 - Support: {prev_oi.support_strike} → {current_oi.support_strike} {support_arrow} (Change: {support_change})
 - PCR: {prev_oi.pcr} → {current_oi.pcr} (Change: {pcr_change:+.2f})
