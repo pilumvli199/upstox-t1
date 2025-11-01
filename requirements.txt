@@ -1,6 +1,49 @@
-smartapi-python==1.0.6
-pyotp==2.8.0
+# ===================================
+# HYBRID TRADING BOT v13.1
+# Multi-Timeframe + News Sentiment
+# ===================================
+
+# Core Dependencies
 requests==2.31.0
-python-telegram-bot==20.0a4
-Flask==2.3.2
-gunicorn==21.2.0
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+
+# Data Processing
+pandas==2.1.4
+numpy==1.26.2
+
+# Visualization
+matplotlib==3.8.2
+
+# Time & Date
+pytz==2023.3
+
+# Redis (Optional - for OI tracking)
+# Comment out if not using Redis
+redis==5.0.1
+
+# API Clients
+# All included via requests
+
+# ===================================
+# INSTALLATION:
+# ===================================
+# pip install -r requirements.txt
+# ===================================
+
+# ===================================
+# OPTIONAL - For Development:
+# ===================================
+# pytest==7.4.3
+# black==23.12.1
+# flake8==6.1.0
+# ===================================
+
+# ===================================
+# NOTES:
+# ===================================
+# 1. Redis is optional - bot works without it
+# 2. Matplotlib for chart generation (PNG alerts)
+# 3. All APIs (Upstox, Finnhub, DeepSeek) use requests
+# 4. python-telegram-bot v20+ required (async support)
+# ===================================
