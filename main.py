@@ -7,6 +7,7 @@ OPTION CHAIN + CHART MONITOR v1.0
 ✅ 15M Candlestick Chart (Last 400 candles)
 ✅ Clean PNG Chart Format
 ✅ Telegram Alerts with Option Chain Table
+✅ Top F&O Stocks + Indices Only
 """
 
 import os
@@ -45,117 +46,123 @@ BASE_URL = "https://api.upstox.com"
 SCAN_INTERVAL = 300  # 5 minutes
 
 # ==================== SYMBOLS ====================
+# 📈 INDICES (F&O Available)
 INDICES = {
-    "NSE_INDEX|Nifty 50": {"name": "NIFTY", "display_name": "NIFTY 50", "expiry_day": 3},
-    "NSE_INDEX|Nifty Bank": {"name": "BANKNIFTY", "display_name": "BANK NIFTY", "expiry_day": 2},
-    "NSE_INDEX|NIFTY MID SELECT": {"name": "MIDCPNIFTY", "display_name": "MIDCAP NIFTY", "expiry_day": 0}
+    "NSE_INDEX|Nifty 50": {"name": "NIFTY", "display_name": "NIFTY 50", "expiry_day": 3, "category": "INDEX"},
+    "NSE_INDEX|Nifty Bank": {"name": "BANKNIFTY", "display_name": "BANK NIFTY", "expiry_day": 2, "category": "INDEX"},
+    "NSE_INDEX|NIFTY MID SELECT": {"name": "MIDCPNIFTY", "display_name": "MIDCAP NIFTY", "expiry_day": 0, "category": "INDEX"},
+    "BSE_INDEX|SENSEX": {"name": "SENSEX", "display_name": "SENSEX", "expiry_day": 4, "category": "INDEX"}
 }
 
-FO_STOCKS = {
-    # Original stocks
-    "NSE_EQ|INE467B01029": {"name": "TATAMOTORS", "display_name": "TATA MOTORS"},
-    "NSE_EQ|INE585B01010": {"name": "MARUTI", "display_name": "MARUTI SUZUKI"},
-    "NSE_EQ|INE101A01026": {"name": "M&M", "display_name": "M&M"},
-    "NSE_EQ|INE917I01010": {"name": "BAJAJ-AUTO", "display_name": "BAJAJ AUTO"},
-    "NSE_EQ|INE040A01034": {"name": "HDFCBANK", "display_name": "HDFC BANK"},
-    "NSE_EQ|INE090A01021": {"name": "ICICIBANK", "display_name": "ICICI BANK"},
-    "NSE_EQ|INE062A01020": {"name": "SBIN", "display_name": "STATE BANK"},
-    "NSE_EQ|INE238A01034": {"name": "AXISBANK", "display_name": "AXIS BANK"},
-    "NSE_EQ|INE237A01028": {"name": "KOTAKBANK", "display_name": "KOTAK BANK"},
-    "NSE_EQ|INE009A01021": {"name": "INFY", "display_name": "INFOSYS"},
-    "NSE_EQ|INE854D01024": {"name": "TCS", "display_name": "TCS"},
-    "NSE_EQ|INE002A01018": {"name": "RELIANCE", "display_name": "RELIANCE"},
-    "NSE_EQ|INE397D01024": {"name": "BHARTIARTL", "display_name": "BHARTI AIRTEL"},
-    "NSE_EQ|INE296A01024": {"name": "BAJFINANCE", "display_name": "BAJAJ FINANCE"},
-    
-    # Additional stocks with correct ISINs
-    "NSE_EQ|INE021A01026": {"name": "ASIANPAINT", "display_name": "ASIAN PAINTS"},
-    "NSE_EQ|INE100A01010": {"name": "ATUL", "display_name": "ATUL LTD"},
-    "NSE_EQ|INE406A01037": {"name": "AUROPHARMA", "display_name": "AUROBINDO PHARMA"},
-    "NSE_EQ|INE192R01011": {"name": "DMART", "display_name": "AVENUE SUPERMARTS"},
-    "NSE_EQ|INE545U01014": {"name": "BANDHANBNK", "display_name": "BANDHAN BANK"},
-    "NSE_EQ|INE028A01039": {"name": "BANKBARODA", "display_name": "BANK OF BARODA"},
-    "NSE_EQ|INE463A01038": {"name": "BERGEPAINT", "display_name": "BERGER PAINTS"},
-    "NSE_EQ|INE263A01024": {"name": "BEL", "display_name": "BHARAT ELECTRONICS"},
-    "NSE_EQ|INE029A01011": {"name": "BPCL", "display_name": "BHARAT PETROLEUM"},
-    "NSE_EQ|INE465A01025": {"name": "BHARATFORG", "display_name": "BHARAT FORGE"},
-    "NSE_EQ|INE257A01026": {"name": "BHEL", "display_name": "BHEL"},
-    "NSE_EQ|INE216A01030": {"name": "BRITANNIA", "display_name": "BRITANNIA"},
-    "NSE_EQ|INE476A01014": {"name": "CANBK", "display_name": "CANARA BANK"},
-    "NSE_EQ|INE121A01024": {"name": "CHOLAFIN", "display_name": "CHOLAMANDALAM"},
-    "NSE_EQ|INE059A01026": {"name": "CIPLA", "display_name": "CIPLA"},
-    "NSE_EQ|INE522F01014": {"name": "COALINDIA", "display_name": "COAL INDIA"},
-    "NSE_EQ|INE591G01017": {"name": "COFORGE", "display_name": "COFORGE"},
-    "NSE_EQ|INE259A01022": {"name": "COLPAL", "display_name": "COLGATE"},
-    "NSE_EQ|INE271C01023": {"name": "DLF", "display_name": "DLF"},
-    "NSE_EQ|INE016A01026": {"name": "DABUR", "display_name": "DABUR"},
-    "NSE_EQ|INE361B01024": {"name": "DIVISLAB", "display_name": "DIVI'S LAB"},
-    "NSE_EQ|INE0J1Y01017": {"name": "LICI", "display_name": "LIC INDIA"},
-    "NSE_EQ|INE089A01023": {"name": "DRREDDY", "display_name": "DR REDDY'S"},
-    "NSE_EQ|INE066A01021": {"name": "EICHERMOT", "display_name": "EICHER MOTORS"},
-    "NSE_EQ|INE129A01019": {"name": "GAIL", "display_name": "GAIL"},
-    "NSE_EQ|INE047A01021": {"name": "GRASIM", "display_name": "GRASIM"},
-    "NSE_EQ|INE860A01027": {"name": "HCLTECH", "display_name": "HCL TECH"},
-    "NSE_EQ|INE795G01014": {"name": "HDFCLIFE", "display_name": "HDFC LIFE"},
-    "NSE_EQ|INE158A01026": {"name": "HEROMOTOCO", "display_name": "HERO MOTOCORP"},
-    "NSE_EQ|INE038A01020": {"name": "HINDALCO", "display_name": "HINDALCO"},
-    "NSE_EQ|INE094A01015": {"name": "HINDPETRO", "display_name": "HINDUSTAN PETRO"},
-    "NSE_EQ|INE030A01027": {"name": "HINDUNILVR", "display_name": "HINDUSTAN UNILEVER"},
-    "NSE_EQ|INE148I01020": {"name": "IBULHSGFIN", "display_name": "INDIABULLS HOUSING"},
-    "NSE_EQ|INE092T01019": {"name": "IDFCFIRSTB", "display_name": "IDFC FIRST BANK"},
-    "NSE_EQ|INE154A01025": {"name": "ITC", "display_name": "ITC"},
-    "NSE_EQ|INE053A01029": {"name": "INDHOTEL", "display_name": "INDIAN HOTELS"},
-    "NSE_EQ|INE095A01012": {"name": "INDUSINDBK", "display_name": "INDUSIND BANK"},
-    "NSE_EQ|INE663F01024": {"name": "NAUKRI", "display_name": "INFO EDGE"},
-    "NSE_EQ|INE335Y01020": {"name": "IRCTC", "display_name": "IRCTC"},
-    "NSE_EQ|INE203G01027": {"name": "IGL", "display_name": "IGL"},
-    "NSE_EQ|INE121J01017": {"name": "INDUSTOWER", "display_name": "INDUS TOWERS"},
-    "NSE_EQ|INE019A01038": {"name": "JSWSTEEL", "display_name": "JSW STEEL"},
-    "NSE_EQ|INE749A01030": {"name": "JINDALSTEL", "display_name": "JINDAL STEEL"},
-    "NSE_EQ|INE018A01030": {"name": "LT", "display_name": "L&T"},
-    "NSE_EQ|INE214T01019": {"name": "LTIM", "display_name": "LTI MINDTREE"},
-    "NSE_EQ|INE115A01026": {"name": "LICHSGFIN", "display_name": "LIC HOUSING"},
-    "NSE_EQ|INE326A01037": {"name": "LUPIN", "display_name": "LUPIN"},
-    "NSE_EQ|INE883A01011": {"name": "MRF", "display_name": "MRF"},
-    "NSE_EQ|INE356A01018": {"name": "MPHASIS", "display_name": "MPHASIS"},
-    "NSE_EQ|INE745G01035": {"name": "MCX", "display_name": "MCX"},
-    "NSE_EQ|INE733E01010": {"name": "NTPC", "display_name": "NTPC"},
-    "NSE_EQ|INE584A01023": {"name": "NMDC", "display_name": "NMDC"},
-    "NSE_EQ|INE213A01029": {"name": "ONGC", "display_name": "ONGC"},
-    "NSE_EQ|INE881D01027": {"name": "OFSS", "display_name": "ORACLE FINANCIAL"},
-    "NSE_EQ|INE982J01020": {"name": "PAYTM", "display_name": "PAYTM"},
-    "NSE_EQ|INE262H01013": {"name": "PERSISTENT", "display_name": "PERSISTENT"},
-    "NSE_EQ|INE318A01026": {"name": "PIDILITIND", "display_name": "PIDILITE"},
-    "NSE_EQ|INE134E01011": {"name": "PFC", "display_name": "POWER FINANCE"},
-    "NSE_EQ|INE752E01010": {"name": "POWERGRID", "display_name": "POWER GRID"},
-    "NSE_EQ|INE160A01022": {"name": "PNB", "display_name": "PUNJAB NATIONAL BANK"},
-    "NSE_EQ|INE020B01018": {"name": "RECLTD", "display_name": "REC LIMITED"},
-    "NSE_EQ|INE018E01016": {"name": "SBICARD", "display_name": "SBI CARD"},
-    "NSE_EQ|INE123W01016": {"name": "SBILIFE", "display_name": "SBI LIFE"},
-    "NSE_EQ|INE070A01015": {"name": "SHREECEM", "display_name": "SHREE CEMENT"},
-    "NSE_EQ|INE003A01024": {"name": "SIEMENS", "display_name": "SIEMENS"},
-    "NSE_EQ|INE044A01036": {"name": "SUNPHARMA", "display_name": "SUN PHARMA"},
-    "NSE_EQ|INE151A01013": {"name": "TATACOMM", "display_name": "TATA COMM"},
-    "NSE_EQ|INE192A01025": {"name": "TATACONSUM", "display_name": "TATA CONSUMER"},
-    "NSE_EQ|INE155A01022": {"name": "TATAMTRDVR", "display_name": "TATA MOTORS DVR"},
-    "NSE_EQ|INE245A01021": {"name": "TATAPOWER", "display_name": "TATA POWER"},
-    "NSE_EQ|INE081A01012": {"name": "TATASTEEL", "display_name": "TATA STEEL"},
-    "NSE_EQ|INE669C01036": {"name": "TECHM", "display_name": "TECH MAHINDRA"},
-    "NSE_EQ|INE280A01028": {"name": "TITAN", "display_name": "TITAN"},
-    "NSE_EQ|INE685A01028": {"name": "TORNTPHARM", "display_name": "TORRENT PHARMA"},
-    "NSE_EQ|INE849A01020": {"name": "TRENT", "display_name": "TRENT"},
-    "NSE_EQ|INE481G01011": {"name": "ULTRACEMCO", "display_name": "ULTRATECH CEMENT"},
-    "NSE_EQ|INE854D01016": {"name": "MCDOWELL-N", "display_name": "UNITED SPIRITS"},
-    "NSE_EQ|INE628A01036": {"name": "UPL", "display_name": "UPL"},
-    "NSE_EQ|INE200M01021": {"name": "VBL", "display_name": "VARUN BEVERAGES"},
-    "NSE_EQ|INE205A01025": {"name": "VEDL", "display_name": "VEDANTA"},
-    "NSE_EQ|INE226A01021": {"name": "VOLTAS", "display_name": "VOLTAS"},
-    "NSE_EQ|INE075A01022": {"name": "WIPRO", "display_name": "WIPRO"},
-    "NSE_EQ|INE758T01015": {"name": "ZOMATO", "display_name": "ZOMATO"},
-    "NSE_EQ|INE010B01027": {"name": "ZYDUSLIFE", "display_name": "ZYDUS LIFESCIENCES"}
+# 🚗 AUTO SECTOR
+AUTO_STOCKS = {
+    "NSE_EQ|INE467B01029": {"name": "TATAMOTORS", "display_name": "TATA MOTORS", "category": "AUTO"},
+    "NSE_EQ|INE585B01010": {"name": "MARUTI", "display_name": "MARUTI SUZUKI", "category": "AUTO"},
+    "NSE_EQ|INE208A01029": {"name": "ASHOKLEY", "display_name": "ASHOK LEYLAND", "category": "AUTO"},
+    "NSE_EQ|INE494B01023": {"name": "TVSMOTOR", "display_name": "TVS MOTOR", "category": "AUTO"},
+    "NSE_EQ|INE101A01026": {"name": "M&M", "display_name": "M&M", "category": "AUTO"},
+    "NSE_EQ|INE917I01010": {"name": "BAJAJ-AUTO", "display_name": "BAJAJ AUTO", "category": "AUTO"}
 }
 
-ALL_SYMBOLS = {**INDICES, **FO_STOCKS}
+# 🏦 BANKING
+BANK_STOCKS = {
+    "NSE_EQ|INE040A01034": {"name": "HDFCBANK", "display_name": "HDFC BANK", "category": "BANK"},
+    "NSE_EQ|INE090A01021": {"name": "ICICIBANK", "display_name": "ICICI BANK", "category": "BANK"},
+    "NSE_EQ|INE062A01020": {"name": "SBIN", "display_name": "STATE BANK", "category": "BANK"},
+    "NSE_EQ|INE028A01039": {"name": "BANKBARODA", "display_name": "BANK OF BARODA", "category": "BANK"},
+    "NSE_EQ|INE238A01034": {"name": "AXISBANK", "display_name": "AXIS BANK", "category": "BANK"},
+    "NSE_EQ|INE237A01028": {"name": "KOTAKBANK", "display_name": "KOTAK BANK", "category": "BANK"},
+    "NSE_EQ|INE949L01017": {"name": "AUBANK", "display_name": "AU SMALL FINANCE", "category": "BANK"}
+}
+
+# 🏭 METALS
+METAL_STOCKS = {
+    "NSE_EQ|INE081A01012": {"name": "TATASTEEL", "display_name": "TATA STEEL", "category": "METAL"},
+    "NSE_EQ|INE038A01020": {"name": "HINDALCO", "display_name": "HINDALCO", "category": "METAL"},
+    "NSE_EQ|INE019A01038": {"name": "JSWSTEEL", "display_name": "JSW STEEL", "category": "METAL"},
+    "NSE_EQ|INE139A01034": {"name": "NATIONALUM", "display_name": "NATIONAL ALUMINIUM", "category": "METAL"}
+}
+
+# ⛽ OIL & GAS
+OIL_GAS_STOCKS = {
+    "NSE_EQ|INE002A01018": {"name": "RELIANCE", "display_name": "RELIANCE", "category": "OIL_GAS"},
+    "NSE_EQ|INE213A01029": {"name": "ONGC", "display_name": "ONGC", "category": "OIL_GAS"},
+    "NSE_EQ|INE242A01010": {"name": "IOC", "display_name": "INDIAN OIL", "category": "OIL_GAS"},
+    "NSE_EQ|INE029A01011": {"name": "BPCL", "display_name": "BHARAT PETROLEUM", "category": "OIL_GAS"},
+    "NSE_EQ|INE347G01014": {"name": "PETRONET", "display_name": "PETRONET LNG", "category": "OIL_GAS"}
+}
+
+# 💻 IT SECTOR
+IT_STOCKS = {
+    "NSE_EQ|INE009A01021": {"name": "INFY", "display_name": "INFOSYS", "category": "IT"},
+    "NSE_EQ|INE075A01022": {"name": "WIPRO", "display_name": "WIPRO", "category": "IT"},
+    "NSE_EQ|INE854D01024": {"name": "TCS", "display_name": "TCS", "category": "IT"},
+    "NSE_EQ|INE860A01027": {"name": "HCLTECH", "display_name": "HCL TECH", "category": "IT"},
+    "NSE_EQ|INE214T01019": {"name": "LTIM", "display_name": "LTI MINDTREE", "category": "IT"}
+}
+
+# 💊 PHARMA
+PHARMA_STOCKS = {
+    "NSE_EQ|INE044A01036": {"name": "SUNPHARMA", "display_name": "SUN PHARMA", "category": "PHARMA"},
+    "NSE_EQ|INE361B01024": {"name": "DIVISLAB", "display_name": "DIVI'S LAB", "category": "PHARMA"},
+    "NSE_EQ|INE089A01023": {"name": "DRREDDY", "display_name": "DR REDDY'S", "category": "PHARMA"},
+    "NSE_EQ|INE059A01026": {"name": "CIPLA", "display_name": "CIPLA", "category": "PHARMA"}
+}
+
+# 🛒 FMCG
+FMCG_STOCKS = {
+    "NSE_EQ|INE154A01025": {"name": "ITC", "display_name": "ITC", "category": "FMCG"},
+    "NSE_EQ|INE030A01027": {"name": "HINDUNILVR", "display_name": "HINDUSTAN UNILEVER", "category": "FMCG"},
+    "NSE_EQ|INE216A01030": {"name": "BRITANNIA", "display_name": "BRITANNIA", "category": "FMCG"},
+    "NSE_EQ|INE016A01026": {"name": "DABUR", "display_name": "DABUR", "category": "FMCG"}
+}
+
+# ⚡ INFRA/POWER
+INFRA_POWER_STOCKS = {
+    "NSE_EQ|INE742F01042": {"name": "ADANIPORTS", "display_name": "ADANI PORTS", "category": "INFRA"},
+    "NSE_EQ|INE733E01010": {"name": "NTPC", "display_name": "NTPC", "category": "POWER"},
+    "NSE_EQ|INE752E01010": {"name": "POWERGRID", "display_name": "POWER GRID", "category": "POWER"},
+    "NSE_EQ|INE018A01030": {"name": "LT", "display_name": "L&T", "category": "INFRA"}
+}
+
+# 👕 RETAIL/CONSUMER
+RETAIL_CONSUMER_STOCKS = {
+    "NSE_EQ|INE280A01028": {"name": "TITAN", "display_name": "TITAN", "category": "RETAIL"},
+    "NSE_EQ|INE797F01012": {"name": "JUBLFOOD", "display_name": "JUBILANT FOODWORKS", "category": "RETAIL"},
+    "NSE_EQ|INE849A01020": {"name": "TRENT", "display_name": "TRENT", "category": "RETAIL"},
+    "NSE_EQ|INE021A01026": {"name": "ASIANPAINT", "display_name": "ASIAN PAINTS", "category": "RETAIL"},
+    "NSE_EQ|INE140A01024": {"name": "PAGEIND", "display_name": "PAGE INDUSTRIES", "category": "RETAIL"}
+}
+
+# 🛡️ INSURANCE
+INSURANCE_STOCKS = {
+    "NSE_EQ|INE795G01014": {"name": "HDFCLIFE", "display_name": "HDFC LIFE", "category": "INSURANCE"},
+    "NSE_EQ|INE123W01016": {"name": "SBILIFE", "display_name": "SBI LIFE", "category": "INSURANCE"},
+    "NSE_EQ|INE115A01026": {"name": "LICHSGFIN", "display_name": "LIC HOUSING", "category": "INSURANCE"}
+}
+
+# 📱 OTHERS (Telecom, Finance)
+OTHER_STOCKS = {
+    "NSE_EQ|INE397D01024": {"name": "BHARTIARTL", "display_name": "BHARTI AIRTEL", "category": "TELECOM"},
+    "NSE_EQ|INE296A01024": {"name": "BAJFINANCE", "display_name": "BAJAJ FINANCE", "category": "FINANCE"},
+    "NSE_EQ|INE758T01015": {"name": "JIOFIN", "display_name": "JIO FINANCIAL", "category": "FINANCE"}
+}
+
+# ✅ COMBINE ALL SYMBOLS
+ALL_SYMBOLS = {
+    **INDICES,
+    **AUTO_STOCKS,
+    **BANK_STOCKS,
+    **METAL_STOCKS,
+    **OIL_GAS_STOCKS,
+    **IT_STOCKS,
+    **PHARMA_STOCKS,
+    **FMCG_STOCKS,
+    **INFRA_POWER_STOCKS,
+    **RETAIL_CONSUMER_STOCKS,
+    **INSURANCE_STOCKS,
+    **OTHER_STOCKS
+}
 
 # ==================== DATA CLASSES ====================
 @dataclass
@@ -353,8 +360,8 @@ class UpstoxDataFetcher:
 # ==================== CHART GENERATOR ====================
 class ChartGenerator:
     @staticmethod
-    def create_candlestick_chart(symbol: str, df: pd.DataFrame, spot_price: float, path: str):
-        """Create clean candlestick chart"""
+    def create_candlestick_chart(symbol: str, df: pd.DataFrame, spot_price: float, category: str, path: str):
+        """Create clean candlestick chart with category"""
         
         # Colors
         BG = '#FFFFFF'
@@ -403,8 +410,16 @@ class ChartGenerator:
                 bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
                          alpha=0.9, edgecolor='#FF9800', linewidth=1.5))
         
+        # Category emoji
+        category_emoji = {
+            "INDEX": "📈", "AUTO": "🚗", "BANK": "🏦", "METAL": "🏭",
+            "OIL_GAS": "⛽", "IT": "💻", "PHARMA": "💊", "FMCG": "🛒",
+            "INFRA": "⚡", "POWER": "⚡", "RETAIL": "👕", "INSURANCE": "🛡️",
+            "TELECOM": "📱", "FINANCE": "💰"
+        }.get(category, "📊")
+        
         # Title
-        title = f"{symbol} | 15M Timeframe | {len(df_plot)} Candles"
+        title = f"{category_emoji} {symbol} | 15M | {len(df_plot)} Candles"
         ax1.set_title(title, color=TEXT, fontsize=14, fontweight='bold', pad=15)
         ax1.grid(True, color=GRID, alpha=0.4)
         ax1.tick_params(colors=TEXT)
@@ -437,7 +452,20 @@ class TelegramNotifier:
 ✅ 21 ATM Strikes (OI, Volume, LTP)
 ✅ 15M Chart (Last 400 candles)
 
-📊 Monitoring: {len(ALL_SYMBOLS)} symbols
+📊 **Monitoring {len(ALL_SYMBOLS)} Symbols:**
+
+📈 Indices: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'INDEX')}
+🚗 Auto: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'AUTO')}
+🏦 Banks: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'BANK')}
+🏭 Metals: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'METAL')}
+⛽ Oil/Gas: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'OIL_GAS')}
+💻 IT: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'IT')}
+💊 Pharma: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'PHARMA')}
+🛒 FMCG: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'FMCG')}
+⚡ Infra/Power: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') in ['INFRA', 'POWER'])}
+👕 Retail: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'RETAIL')}
+🛡️ Insurance: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') == 'INSURANCE')}
+📱 Others: {sum(1 for v in ALL_SYMBOLS.values() if v.get('category') in ['TELECOM', 'FINANCE'])}
 
 🟢 **BOT ACTIVE**"""
         
@@ -445,7 +473,7 @@ class TelegramNotifier:
     
     async def send_option_chain_alert(self, symbol: str, display_name: str,
                                      spot_price: float, strikes: List[StrikeData],
-                                     chart_path: str, expiry: str):
+                                     chart_path: str, expiry: str, category: str):
         """Send option chain data with chart"""
         try:
             # Send chart first
@@ -457,9 +485,17 @@ class TelegramNotifier:
             total_pe_oi = sum(s.pe_oi for s in strikes)
             pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
             
+            # Category emoji
+            category_emoji = {
+                "INDEX": "📈", "AUTO": "🚗", "BANK": "🏦", "METAL": "🏭",
+                "OIL_GAS": "⛽", "IT": "💻", "PHARMA": "💊", "FMCG": "🛒",
+                "INFRA": "⚡", "POWER": "⚡", "RETAIL": "👕", "INSURANCE": "🛡️",
+                "TELECOM": "📱", "FINANCE": "💰"
+            }.get(category, "📊")
+            
             # Build message
             msg = f"""━━━━━━━━━━━━━━━━━━━━━━
-📊 **{display_name}**
+{category_emoji} **{display_name}**
 ━━━━━━━━━━━━━━━━━━━━━━
 
 💹 **Spot:** ₹{spot_price:.2f}
@@ -533,9 +569,10 @@ class OptionMonitorBot:
         try:
             symbol_name = symbol_info.get('name', '')
             display_name = symbol_info.get('display_name', symbol_name)
+            category = symbol_info.get('category', 'OTHER')
             
             logger.info(f"\n{'='*70}")
-            logger.info(f"🔍 {display_name}")
+            logger.info(f"🔍 {display_name} ({category})")
             logger.info(f"{'='*70}")
             
             # Get expiry
@@ -569,7 +606,7 @@ class OptionMonitorBot:
             atm = round(spot_price / 100) * 100
             
             # Define strike range based on symbol type
-            if "INDEX" in instrument_key:
+            if category == "INDEX":
                 strike_interval = 100
                 strikes_count = 10
             else:
@@ -598,14 +635,14 @@ class OptionMonitorBot:
             # Generate chart
             chart_path = f"/tmp/{symbol_name}_option_monitor.png"
             ChartGenerator.create_candlestick_chart(
-                display_name, df_15m, spot_price, chart_path
+                display_name, df_15m, spot_price, category, chart_path
             )
             logger.info(f"  📊 Chart generated")
             
             # Send alert
             await self.notifier.send_option_chain_alert(
                 symbol_name, display_name, spot_price,
-                atm_strikes, chart_path, expiry_display
+                atm_strikes, chart_path, expiry_display, category
             )
             
             logger.info(f"  ✅ Analysis complete")
