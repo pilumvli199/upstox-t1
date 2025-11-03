@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-HYBRID TRADING BOT v19.0 - HOLIDAY-AWARE EXPIRY
-=========================================================
-✅ Automatic holiday detection
-✅ Smart expiry day selection (skips holidays)
-✅ NSE/BSE trading calendar integration
-✅ Fallback to API-based expiry detection
+HYBRID TRADING BOT v11.0
+- Upstox data fetching (indices + stocks)
+- DeepSeek AI analysis with advanced strategies
+- Two-phase filtering: Quick scan → Deep analysis
+- Chart + Option chain combined analysis
 """
 
 import os
@@ -22,122 +21,149 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import pandas as pd
 import io
+import numpy as np
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import traceback
 import re
 
-# Redis import with fallback
-try:
-    import redis
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-    logging.warning("Redis not available - running without OI tracking")
-
 # Setup logging
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('trading_bot.log'),
-        logging.StreamHandler()
-    ]
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== CONFIG ====================
+# CONFIG
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-
 BASE_URL = "https://api.upstox.com"
 IST = pytz.timezone('Asia/Kolkata')
 
-# Trading thresholds
-CONFIDENCE_MIN = 75
-SCORE_MIN = 90
-SCAN_INTERVAL = 300  # 5 minutes
-SIGNAL_COOLDOWN = 1800  # 30 minutes
-
-# ==================== INDICES CONFIG ====================
+# INDICES - 4 Selected
 INDICES = {
-    'NSE_INDEX|Nifty 50': {
-        'name': 'NIFTY50',
-        'display_name': 'NIFTY 50',
-        'preferred_expiry_day': 1,  # Tuesday (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri)
-        'lot_size': 50,
-        'tick_size': 0.05
-    },
-    'NSE_INDEX|Sensex': {
-        'name': 'SENSEX',
-        'display_name': 'SENSEX',
-        'preferred_expiry_day': 3,  # Thursday
-        'lot_size': 10,
-        'tick_size': 0.05
-    }
+    "NSE_INDEX|Nifty 50": {"name": "NIFTY 50", "expiry_day": 1},
+    "NSE_INDEX|Nifty Bank": {"name": "BANK NIFTY", "expiry_day": 2},
+    "NSE_INDEX|Nifty Midcap Select": {"name": "MIDCAP NIFTY", "expiry_day": 0},
+    "NSE_INDEX|Sensex": {"name": "SENSEX", "expiry_day": 4}
 }
 
-# ==================== NSE HOLIDAY CALENDAR 2025 ====================
-# Source: https://www.nseindia.com/regulations/trading-holidays
-NSE_HOLIDAYS_2025 = [
-    '2025-01-26',  # Republic Day
-    '2025-03-14',  # Holi
-    '2025-03-31',  # Id-Ul-Fitr
-    '2025-04-10',  # Mahavir Jayanti
-    '2025-04-14',  # Dr. Ambedkar Jayanti
-    '2025-04-18',  # Good Friday
-    '2025-05-01',  # Maharashtra Day
-    '2025-06-07',  # Id-Ul-Adha (Bakri Id)
-    '2025-07-07',  # Muharram
-    '2025-08-15',  # Independence Day
-    '2025-08-27',  # Ganesh Chaturthi
-    '2025-10-02',  # Gandhi Jayanti
-    '2025-10-21',  # Dussehra
-    '2025-11-01',  # Diwali (Laxmi Pujan)*
-    '2025-11-03',  # Diwali - Balipratipada
-    '2025-11-05',  # Gurunanak Jayanti
-    '2025-12-25',  # Christmas
-]
+# STOCKS - Organized by Sector
+SELECTED_STOCKS = {
+    # Auto 🚗
+    "NSE_EQ|INE467B01029": "TATAMOTORS",
+    "NSE_EQ|INE585B01010": "MARUTI",
+    "NSE_EQ|INE208A01029": "ASHOKLEY",
+    "NSE_EQ|INE494B01023": "TVSMOTOR",
+    "NSE_EQ|INE101A01026": "M&M",
+    "NSE_EQ|INE917I01010": "BAJAJ-AUTO",
+    
+    # Banks 🏦
+    "NSE_EQ|INE040A01034": "HDFCBANK",
+    "NSE_EQ|INE090A01021": "ICICIBANK",
+    "NSE_EQ|INE062A01020": "SBIN",
+    "NSE_EQ|INE028A01039": "BANKBARODA",
+    "NSE_EQ|INE238A01034": "AXISBANK",
+    "NSE_EQ|INE237A01028": "KOTAKBANK",
+    
+    # Metals 🏭
+    "NSE_EQ|INE155A01022": "TATASTEEL",
+    "NSE_EQ|INE205A01025": "HINDALCO",
+    "NSE_EQ|INE019A01038": "JSWSTEEL",
+    
+    # Oil & Gas ⛽
+    "NSE_EQ|INE002A01018": "RELIANCE",
+    "NSE_EQ|INE213A01029": "ONGC",
+    "NSE_EQ|INE242A01010": "IOC",
+    
+    # IT 💻
+    "NSE_EQ|INE009A01021": "INFY",
+    "NSE_EQ|INE075A01022": "WIPRO",
+    "NSE_EQ|INE854D01024": "TCS",
+    "NSE_EQ|INE047A01021": "HCLTECH",
+    
+    # Pharma 💊
+    "NSE_EQ|INE044A01036": "SUNPHARMA",
+    "NSE_EQ|INE361B01024": "DIVISLAB",
+    "NSE_EQ|INE089A01023": "DRREDDY",
+    
+    # FMCG 🛒
+    "NSE_EQ|INE154A01025": "ITC",
+    "NSE_EQ|INE030A01027": "HUL",
+    "NSE_EQ|INE216A01030": "BRITANNIA",
+    
+    # Infra/Power ⚡
+    "NSE_EQ|INE742F01042": "ADANIPORTS",
+    "NSE_EQ|INE733E01010": "NTPC",
+    "NSE_EQ|INE018A01030": "LT",
+    
+    # Retail/Consumer 👕
+    "NSE_EQ|INE280A01028": "TITAN",
+    "NSE_EQ|INE849A01020": "TRENT",
+    "NSE_EQ|INE021A01026": "ASIANPAINT",
+    
+    # Others
+    "NSE_EQ|INE397D01024": "BHARTIARTL",
+    "NSE_EQ|INE296A01024": "BAJFINANCE"
+}
 
-# ==================== DATA CLASSES ====================
-@dataclass
-class KeyOIZones:
-    """OI zones with PCR and key strikes"""
-    pcr: float = 0.0
-    resistance_strike: int = 0
-    support_strike: int = 0
-    max_call_oi: int = 0
-    max_put_oi: int = 0
-    total_call_oi: int = 0
-    total_put_oi: int = 0
-    timestamp: str = ""
+# Analysis thresholds
+PHASE1_CONFIDENCE_MIN = 70
+PHASE1_OI_DIVERGENCE_MIN = 2.5
+PHASE1_VOLUME_MIN = 25.0
+
+PHASE2_CONFIDENCE_MIN = 75
+PHASE2_SCORE_MIN = 90
+PHASE2_ALIGNMENT_MIN = 18
+
+SCAN_INTERVAL = 900  # 15 minutes
+OI_CACHE = {}  # Store previous OI
 
 @dataclass
-class MultiTimeframeData:
-    """Candlestick data with spot price"""
-    df_15m: pd.DataFrame
-    spot_price: float
+class OIData:
+    strike: float
+    ce_oi: int
+    pe_oi: int
+    ce_volume: int
+    pe_volume: int
+    ce_oi_change: int = 0
+    pe_oi_change: int = 0
+    ce_iv: float = 0.0
+    pe_iv: float = 0.0
+    pcr_at_strike: float = 0.0
 
 @dataclass
-class NewsData:
-    """Market news data"""
-    headline: str
-    summary: str
-    sentiment: str
-    impact_score: int
-    url: str
+class AggregateOIAnalysis:
+    total_ce_oi: int
+    total_pe_oi: int
+    total_ce_volume: int
+    total_pe_volume: int
+    ce_oi_change_pct: float
+    pe_oi_change_pct: float
+    ce_volume_change_pct: float
+    pe_volume_change_pct: float
+    pcr: float
+    overall_sentiment: str
+    max_pain: float = 0.0
+
+@dataclass
+class QuickAnalysis:
+    opportunity: str
+    confidence: int
+    oi_divergence: float
+    volume_surge: float
+    pcr: float
+    passed_phase1: bool
+    reason: str
 
 @dataclass
 class DeepAnalysis:
-    """Complete trade analysis from AI"""
     opportunity: str
     confidence: int
+    chart_score: int
+    option_score: int
+    alignment_score: int
     total_score: int
     entry_price: float
     stop_loss: float
@@ -145,1387 +171,1027 @@ class DeepAnalysis:
     target_2: float
     risk_reward: str
     recommended_strike: int
+    pattern_signal: str
+    oi_flow_signal: str
     market_structure: str
     support_levels: List[float]
     resistance_levels: List[float]
-    chart_bias: str
-    pattern_signal: str = "N/A"
-    oi_flow_signal: str = "N/A"
-    risk_factors: List[str] = field(default_factory=list)
-    news_sentiment: str = "NEUTRAL"
-    news_impact: int = 0
+    scenario_bullish: str
+    scenario_bearish: str
+    risk_factors: List[str]
+    monitoring_checklist: List[str]
 
-# ==================== HOLIDAY MANAGER ====================
-class HolidayManager:
-    """Smart holiday-aware expiry calculator"""
-
-    def __init__(self):
-        self.holidays = set(NSE_HOLIDAYS_2025)
-        logger.info(f"📅 Loaded {len(self.holidays)} NSE holidays for 2025")
-
-    def is_trading_day(self, date: datetime) -> bool:
-        """Check if given date is a trading day"""
-        # Weekend check
-        if date.weekday() >= 5:  # Saturday=5, Sunday=6
-            return False
-
-        # Holiday check
-        date_str = date.strftime('%Y-%m-%d')
-        if date_str in self.holidays:
-            logger.info(f"  🚫 {date_str} is a holiday")
-            return False
-
-        return True
-
-    def get_next_trading_day(self, start_date: datetime, target_weekday: int) -> datetime:
-        """
-        Get next trading day for target weekday, accounting for holidays
-        
-        Args:
-            start_date: Starting date
-            target_weekday: Target day (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri)
-        
-        Returns:
-            Next valid trading day
-        """
-        current = start_date
-
-        # Find next occurrence of target weekday
-        days_ahead = target_weekday - current.weekday()
-        if days_ahead <= 0:  # Target day already passed this week
-            days_ahead += 7
-
-        target_date = current + timedelta(days=days_ahead)
-
-        # Check if it's a trading day
-        max_attempts = 10  # Prevent infinite loop
-        attempts = 0
-
-        while not self.is_trading_day(target_date) and attempts < max_attempts:
-            logger.info(f"  ⚠️ {target_date.strftime('%Y-%m-%d')} is not a trading day")
-
-            # Try previous day first (prepone expiry)
-            prev_day = target_date - timedelta(days=1)
-            if self.is_trading_day(prev_day):
-                logger.info(f"  ✅ Expiry preponed to {prev_day.strftime('%Y-%m-%d %A')}")
-                return prev_day
-
-            # Try next day (postpone expiry)
-            next_day = target_date + timedelta(days=1)
-            if self.is_trading_day(next_day):
-                logger.info(f"  ✅ Expiry postponed to {next_day.strftime('%Y-%m-%d %A')}")
-                return next_day
-
-            # If both fail, try day before previous
-            prev_prev = target_date - timedelta(days=2)
-            if self.is_trading_day(prev_prev):
-                logger.info(f"  ✅ Expiry preponed to {prev_prev.strftime('%Y-%m-%d %A')}")
-                return prev_prev
-
-            # Last resort: move to next week
-            target_date = target_date + timedelta(days=7)
-            attempts += 1
-
-        if attempts >= max_attempts:
-            logger.error("❌ Could not find valid trading day after 10 attempts!")
-
-        return target_date
-
-    def get_current_week_expiry(self, target_weekday: int) -> Optional[str]:
-        """
-        Get expiry for current week
-        
-        Args:
-            target_weekday: Preferred expiry day (0=Mon, 1=Tue, etc.)
-        
-        Returns:
-            Expiry date string in 'YYYY-MM-DD' format
-        """
-        now = datetime.now(IST)
-
-        # If it's after 3:30 PM on target day, look for next week
-        if now.weekday() == target_weekday and now.time() > time(15, 30):
-            now = now + timedelta(days=7)
-
-        expiry_date = self.get_next_trading_day(now, target_weekday)
-        expiry_str = expiry_date.strftime('%Y-%m-%d')
-
-        logger.info(f"  📅 Calculated expiry: {expiry_str} ({expiry_date.strftime('%A')})")
-        return expiry_str
-
-# ==================== FINNHUB NEWS API ====================
-class FinnhubNewsAPI:
-    def __init__(self):
-        self.api_key = FINNHUB_API_KEY
-        self.base_url = "https://finnhub.io/api/v1"
-        self.connected = bool(self.api_key)
-        if self.connected:
-            logger.info("✅ Finnhub API connected")
-        else:
-            logger.warning("⚠️ Finnhub API key not found")
-
-    def get_market_news(self, limit: int = 15) -> List[Dict]:
-        """Fetch latest market news"""
-        if not self.connected:
-            return []
-
-        try:
-            url = f"{self.base_url}/news?category=general&token={self.api_key}"
-            response = requests.get(url, timeout=10)
-
-            if response.status_code == 200:
-                news_list = response.json()[:limit]
-                logger.info(f"📰 Fetched {len(news_list)} news articles")
-                return news_list
-            else:
-                logger.warning(f"News API returned status {response.status_code}")
-
-        except Exception as e:
-            logger.error(f"News fetch error: {e}")
-
-        return []
-
-# ==================== REDIS CACHE ====================
-class RedisCache:
-    def __init__(self):
-        self.redis_client = None
-        self.connected = False
-
-        if not REDIS_AVAILABLE:
-            logger.warning("⚠️ Redis library not available")
-            return
-
-        try:
-            self.redis_client = redis.from_url(
-                REDIS_URL,
-                decode_responses=True,
-                socket_connect_timeout=5
-            )
-            self.redis_client.ping()
-            self.connected = True
-            logger.info("✅ Redis connected successfully!")
-
-        except Exception as e:
-            logger.error(f"❌ Redis connection failed: {e}")
-            self.connected = False
-
-    def store_and_get_oi_snapshots(
-        self,
-        symbol: str,
-        current_zones: KeyOIZones
-    ) -> Tuple[KeyOIZones, Optional[KeyOIZones]]:
-        """Store current OI and return previous for comparison"""
-
-        if not self.connected:
-            return current_zones, None
-
-        try:
-            now = datetime.now(IST)
-            current_zones_json = json.dumps(current_zones.__dict__)
-
-            # Daily opening snapshot key
-            key_opening = f"oi_snapshot:opening:{symbol}:{now.date()}"
-            # Rolling 30-min snapshot key
-            key_30min = f"oi_snapshot:30min:{symbol}"
-
-            # Store opening snapshot once per day
-            if not self.redis_client.exists(key_opening):
-                self.redis_client.setex(key_opening, 86400, current_zones_json)
-                logger.info(f"💾 Stored opening OI snapshot for {symbol}")
-                return current_zones, None
-
-            # Determine which snapshot to compare against
-            if now.time() < time(9, 45):
-                # First 30 mins: compare with opening
-                prev_json = self.redis_client.get(key_opening)
-                comparison_label = "Market Opening"
-                logger.info(f"  📊 Comparing with Opening OI (before 9:45)")
-            else:
-                # After 9:45: compare with 30-min old snapshot
-                prev_json = self.redis_client.get(key_30min)
-                comparison_label = "30-min ago"
-                logger.info(f"  📊 Comparing with 30-min old OI")
-
-            # Update the 30-min snapshot with current data
-            self.redis_client.setex(key_30min, 1800, current_zones_json)
-
-            # Parse previous snapshot
-            previous_zones = None
-            if prev_json:
-                try:
-                    previous_zones = KeyOIZones(**json.loads(prev_json))
-                    logger.info(f"  ✅ Got previous OI data from {comparison_label}")
-                except Exception as e:
-                    logger.error(f"Error parsing previous OI: {e}")
-
-            return current_zones, previous_zones
-
-        except Exception as e:
-            logger.error(f"Redis OI snapshot error: {e}")
-            return current_zones, None
-
-# ==================== UPSTOX DATA FETCHER ====================
 class UpstoxDataFetcher:
-    def __init__(self):
-        self.connected = self.test_connection()
-        self.holiday_manager = HolidayManager()
-
-    def test_connection(self) -> bool:
-        """Test Upstox API connection"""
-        try:
-            if not UPSTOX_ACCESS_TOKEN:
-                logger.error("❌ Upstox Access Token not found")
-                return False
-
-            headers = {
-                "Accept": "application/json",
-                "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"
-            }
-
-            response = requests.get(
-                f"{BASE_URL}/v2/user/profile",
-                headers=headers,
-                timeout=10
-            )
-
-            if response.status_code == 200:
-                user_data = response.json().get('data', {})
-                logger.info(f"✅ Upstox connected! User: {user_data.get('user_name', 'Unknown')}")
-                return True
-            else:
-                logger.error(f"❌ Upstox connection failed: {response.status_code}")
-                return False
-
-        except Exception as e:
-            logger.error(f"❌ Upstox connection error: {e}")
-            return False
-
-    def get_expiries_from_api(self, instrument_key: str) -> List[str]:
-        """Get all available expiries from Upstox API"""
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"
-        }
-
+    """Upstox API for data fetching"""
+    
+    @staticmethod
+    def get_expiries(instrument_key):
+        """Fetch all available expiries"""
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
         encoded_key = urllib.parse.quote(instrument_key, safe='')
         url = f"{BASE_URL}/v2/option/contract?instrument_key={encoded_key}"
-
         try:
             resp = requests.get(url, headers=headers, timeout=10)
-
             if resp.status_code == 200:
                 contracts = resp.json().get('data', [])
-                expiries = sorted(list(set(
-                    c['expiry'] for c in contracts if 'expiry' in c
-                )))
-                logger.info(f"  📋 Found {len(expiries)} expiries from API")
-                return expiries
-            else:
-                logger.warning(f"Expiries fetch failed: {resp.status_code}")
-
+                return sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
         except Exception as e:
-            logger.error(f"Error fetching expiries from API: {e}")
-
+            logger.error(f"Expiry fetch error: {e}")
         return []
-
-    def get_next_expiry(
-        self,
-        instrument_key: str,
-        preferred_expiry_day: int,
-        symbol_name: str
-    ) -> str:
-        """
-        Smart expiry selection with holiday awareness
+    
+    @staticmethod
+    def get_next_expiry(instrument_key, expiry_day=1):
+        """Auto-select nearest valid expiry"""
+        expiries = UpstoxDataFetcher.get_expiries(instrument_key)
+        if not expiries:
+            today = datetime.now(IST)
+            days_ahead = expiry_day - today.weekday()
+            if days_ahead <= 0:
+                days_ahead += 7
+            return (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
         
-        Strategy:
-        1. Calculate expiry using holiday calendar
-        2. Verify against API expiries
-        3. Fallback to API if calculation fails
-        """
-        logger.info(f"  🔍 Finding next expiry for {symbol_name}...")
-
-        # Method 1: Calculate using holiday calendar
-        calculated_expiry = self.holiday_manager.get_current_week_expiry(
-            preferred_expiry_day
-        )
-
-        # Method 2: Get actual expiries from API
-        api_expiries = self.get_expiries_from_api(instrument_key)
-
-        if not api_expiries:
-            # No API data - trust calculation
-            logger.info(f"  ✅ Using calculated expiry: {calculated_expiry}")
-            return calculated_expiry
-
-        # Filter future expiries
         today = datetime.now(IST).date()
         now_time = datetime.now(IST).time()
-
-        future_expiries = [
-            exp for exp in api_expiries
-            if datetime.strptime(exp, '%Y-%m-%d').date() > today
-            or (datetime.strptime(exp, '%Y-%m-%d').date() == today
-                and now_time < time(15, 30))
-        ]
-
-        if not future_expiries:
-            logger.warning("  ⚠️ No future expiries found in API")
-            return calculated_expiry
-
-        # Check if calculated expiry matches API
-        if calculated_expiry in future_expiries:
-            logger.info(f"  ✅ Expiry verified: {calculated_expiry} (matches API)")
-            return calculated_expiry
-
-        # If mismatch, prefer nearest API expiry
-        nearest_expiry = min(future_expiries)
-        logger.warning(
-            f"  ⚠️ Calculated expiry {calculated_expiry} not in API. "
-            f"Using nearest: {nearest_expiry}"
-        )
-
-        return nearest_expiry
-
+        
+        future_expiries = []
+        for exp_str in expiries:
+            exp_date = datetime.strptime(exp_str, '%Y-%m-%d').date()
+            if exp_date > today or (exp_date == today and now_time < time(15, 30)):
+                future_expiries.append(exp_str)
+        
+        return min(future_expiries) if future_expiries else expiries[0]
+    
     @staticmethod
-    def get_option_chain(instrument_key: str, expiry: str) -> List[Dict]:
-        """Fetch complete option chain for given expiry"""
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"
-        }
-
+    def get_option_chain(instrument_key, expiry):
+        """Fetch full option chain"""
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
         encoded_key = urllib.parse.quote(instrument_key, safe='')
         url = f"{BASE_URL}/v2/option/chain?instrument_key={encoded_key}&expiry_date={expiry}"
-
         try:
             resp = requests.get(url, headers=headers, timeout=15)
-
             if resp.status_code == 200:
-                chain = resp.json().get('data', [])
-                sorted_chain = sorted(chain, key=lambda x: x.get('strike_price', 0))
-                logger.info(f"  ✅ Fetched option chain: {len(sorted_chain)} strikes")
-                return sorted_chain
-            else:
-                logger.error(f"Option chain fetch failed: {resp.status_code}")
-
+                strikes = resp.json().get('data', [])
+                return sorted(strikes, key=lambda x: x.get('strike_price', 0))
         except Exception as e:
-            logger.error(f"Error fetching option chain: {e}")
-
+            logger.error(f"Chain fetch error: {e}")
         return []
-
+    
     @staticmethod
-    def get_candlestick_data(instrument_key: str) -> Optional[MultiTimeframeData]:
-        """Fetch 15-min candlestick data"""
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"
-        }
-
+    def get_spot_price(instrument_key):
+        """Fetch current spot price"""
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
         encoded_key = urllib.parse.quote(instrument_key, safe='')
-        all_candles = []
-
-        try:
-            to_date = datetime.now(IST).strftime('%Y-%m-%d')
-            from_date = (datetime.now(IST) - timedelta(days=7)).strftime('%Y-%m-%d')
-
-            url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/15minute/{to_date}/{from_date}"
-
-            resp = requests.get(url, headers=headers, timeout=20)
-
-            if resp.status_code == 200 and resp.json().get('status') == 'success':
-                candles = resp.json().get('data', {}).get('candles', [])
-                all_candles.extend(candles)
-                logger.info(f"  📊 Fetched {len(candles)} candles (15min)")
-            else:
-                logger.warning(f"Historical data fetch failed: {resp.text}")
-                return None
-
-        except Exception as e:
-            logger.error(f"Candlestick data error: {e}")
-            return None
-
-        if not all_candles:
-            logger.warning("❌ No candlestick data available")
-            return None
-
-        # Create DataFrame
-        df = pd.DataFrame(
-            all_candles,
-            columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
-        )
-
-        df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(IST)
-        df = df.set_index('timestamp').astype(float).sort_index(ascending=True)
-
-        spot_price = df['close'].iloc[-1] if not df.empty else 0
-
-        return MultiTimeframeData(df_15m=df, spot_price=spot_price)
-
-# ==================== NEWS ANALYZER ====================
-class NewsAnalyzer:
+        url = f"{BASE_URL}/v2/market-quote/quotes?instrument_key={encoded_key}"
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    quote_data = resp.json().get('data', {})
+                    if quote_data:
+                        ltp = quote_data[list(quote_data.keys())[0]].get('last_price', 0)
+                        if ltp:
+                            return float(ltp)
+                time_sleep.sleep(2)
+            except Exception as e:
+                logger.error(f"Spot price error (attempt {attempt + 1}): {e}")
+                time_sleep.sleep(2)
+        return 0
+    
     @staticmethod
-    def filter_and_analyze_news(
-        symbol: str,
-        news_list: List[Dict]
-    ) -> Optional[NewsData]:
-        """Filter and analyze relevant news"""
-
-        if not news_list:
-            return None
-
+    def get_candle_data(instrument_key, symbol):
+        """Fetch historical + intraday candles"""
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
+        encoded_key = urllib.parse.quote(instrument_key, safe='')
+        
+        all_candles = []
+        
+        # Historical 30-min data
         try:
-            relevant_news = []
-
-            # Indian market keywords
-            keywords = [
-                "nifty", "sensex", "rbi", "rupee", "inflation", "gdp",
-                "sebi", "indian market", "finance minister", "monetary policy",
-                "repo rate", "bse", "nse"
-            ]
-
-            # Filter relevant news
-            for news in news_list:
-                combined_text = (
-                    news.get('headline', '') + " " + news.get('summary', '')
-                ).lower()
-
-                if any(kw in combined_text for kw in keywords):
-                    # Exclude US-centric news
-                    us_keywords = [
-                        "fed", "dollar", "nasdaq", "dow jones",
-                        "s&p 500", "wall street"
-                    ]
-                    if not any(us_kw in combined_text for us_kw in us_keywords):
-                        relevant_news.append(news)
-
-            if not relevant_news:
-                return None
-
-            # Use top news
-            top_news = relevant_news[0]
-
-            return NewsData(
-                headline=top_news.get('headline', '')[:100],
-                summary=top_news.get('summary', '')[:200] + '...',
-                sentiment="NEUTRAL",
-                impact_score=70,
-                url=top_news.get('url', '')
-            )
-
+            to_date = (datetime.now(IST) - timedelta(days=1)).strftime('%Y-%m-%d')
+            from_date = (datetime.now(IST) - timedelta(days=10)).strftime('%Y-%m-%d')
+            url = f"{BASE_URL}/v2/historical-candle/{encoded_key}/30minute/{to_date}/{from_date}"
+            resp = requests.get(url, headers=headers, timeout=20)
+            
+            if resp.status_code == 200 and resp.json().get('status') == 'success':
+                candles_30min = resp.json().get('data', {}).get('candles', [])
+                for candle in candles_30min:
+                    all_candles.append(candle)
         except Exception as e:
-            logger.error(f"News analysis error: {e}")
+            logger.error(f"Historical candle error: {e}")
+        
+        # Today's 1-min intraday
+        try:
+            url = f"{BASE_URL}/v2/historical-candle/intraday/{encoded_key}/1minute"
+            resp = requests.get(url, headers=headers, timeout=20)
+            
+            if resp.status_code == 200 and resp.json().get('status') == 'success':
+                candles_1min = resp.json().get('data', {}).get('candles', [])
+                all_candles.extend(candles_1min)
+        except Exception as e:
+            logger.error(f"Intraday candle error: {e}")
+        
+        if not all_candles:
             return None
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df = df.set_index('timestamp').astype(float)
+        
+        # Resample to 15-min
+        df_15m = df.resample('15min').agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum',
+            'oi': 'last'
+        }).dropna()
+        
+        return df_15m
 
-# ==================== OI ANALYZER ====================
 class OIAnalyzer:
-    def get_key_oi_zones(
-        self,
-        strikes: List[Dict],
-        spot_price: float
-    ) -> KeyOIZones:
-        """Extract key OI zones from option chain"""
-
+    """Option chain analysis with OI tracking"""
+    
+    @staticmethod
+    def parse_option_chain(strikes, spot_price) -> List[OIData]:
+        """Convert raw option chain to OIData"""
         if not strikes:
-            return KeyOIZones()
-
-        total_pe_oi = 0
-        total_ce_oi = 0
-        max_pe_oi = 0
-        max_ce_oi = 0
-        support_strike = 0
-        resistance_strike = 0
-
-        # Consider strikes within +/- 5% of spot
-        strike_range_min = spot_price * 0.95
-        strike_range_max = spot_price * 1.05
-
+            return []
+        
+        # Find ATM
+        atm_strike = min(strikes, key=lambda x: abs(x.get('strike_price', 0) - spot_price))
+        atm_price = atm_strike.get('strike_price', 0)
+        
+        oi_list = []
         for s in strikes:
             sp = s.get('strike_price', 0)
-
-            if not (strike_range_min <= sp <= strike_range_max):
+            
+            # Filter strikes within 5% of ATM
+            if abs(sp - atm_price) > (atm_price * 0.05):
                 continue
-
-            ce_oi = s.get('call_options', {}).get('market_data', {}).get('oi', 0)
-            pe_oi = s.get('put_options', {}).get('market_data', {}).get('oi', 0)
-
-            total_ce_oi += ce_oi
-            total_pe_oi += pe_oi
-
-            # Track max Call OI (resistance)
-            if ce_oi > max_ce_oi:
-                max_ce_oi = ce_oi
-                resistance_strike = sp
-
-            # Track max Put OI (support)
-            if pe_oi > max_pe_oi:
-                max_pe_oi = pe_oi
-                support_strike = sp
-
-        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 0
-
-        return KeyOIZones(
+            
+            ce_data = s.get('call_options', {}).get('market_data', {})
+            pe_data = s.get('put_options', {}).get('market_data', {})
+            
+            ce_oi = ce_data.get('oi', 0)
+            pe_oi = pe_data.get('oi', 0)
+            
+            oi_list.append(OIData(
+                strike=sp,
+                ce_oi=ce_oi,
+                pe_oi=pe_oi,
+                ce_volume=ce_data.get('volume', 0),
+                pe_volume=pe_data.get('volume', 0),
+                ce_iv=ce_data.get('iv', 0.0),
+                pe_iv=pe_data.get('iv', 0.0),
+                pcr_at_strike=pe_oi / ce_oi if ce_oi > 0 else 0
+            ))
+        
+        return oi_list
+    
+    @staticmethod
+    def get_aggregate_analysis(symbol: str, current_oi: List[OIData]) -> Optional[AggregateOIAnalysis]:
+        """Compare OI with cached data"""
+        if not current_oi:
+            return None
+        
+        cache_key = symbol
+        prev_oi_data = OI_CACHE.get(cache_key, {})
+        
+        # Calculate totals
+        total_ce_oi = sum(oi.ce_oi for oi in current_oi)
+        total_pe_oi = sum(oi.pe_oi for oi in current_oi)
+        total_ce_volume = sum(oi.ce_volume for oi in current_oi)
+        total_pe_volume = sum(oi.pe_volume for oi in current_oi)
+        
+        # Get old totals
+        old_ce_oi = prev_oi_data.get('total_ce_oi', total_ce_oi)
+        old_pe_oi = prev_oi_data.get('total_pe_oi', total_pe_oi)
+        old_ce_volume = prev_oi_data.get('total_ce_volume', total_ce_volume)
+        old_pe_volume = prev_oi_data.get('total_pe_volume', total_pe_volume)
+        
+        # Calculate changes
+        ce_oi_change_pct = ((total_ce_oi - old_ce_oi) / old_ce_oi * 100) if old_ce_oi > 0 else 0
+        pe_oi_change_pct = ((total_pe_oi - old_pe_oi) / old_pe_oi * 100) if old_pe_oi > 0 else 0
+        ce_volume_change_pct = ((total_ce_volume - old_ce_volume) / old_ce_volume * 100) if old_ce_volume > 0 else 0
+        pe_volume_change_pct = ((total_pe_volume - old_pe_volume) / old_pe_volume * 100) if old_pe_volume > 0 else 0
+        
+        pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
+        
+        # Sentiment
+        sentiment = "NEUTRAL"
+        if pe_oi_change_pct > 3 and pe_oi_change_pct > ce_oi_change_pct:
+            sentiment = "BULLISH"
+        elif ce_oi_change_pct > 3 and ce_oi_change_pct > pe_oi_change_pct:
+            sentiment = "BEARISH"
+        elif pcr > 1.2:
+            sentiment = "BULLISH"
+        elif pcr < 0.8:
+            sentiment = "BEARISH"
+        
+        # Update cache
+        OI_CACHE[cache_key] = {
+            'total_ce_oi': total_ce_oi,
+            'total_pe_oi': total_pe_oi,
+            'total_ce_volume': total_ce_volume,
+            'total_pe_volume': total_pe_volume
+        }
+        
+        return AggregateOIAnalysis(
+            total_ce_oi=total_ce_oi,
+            total_pe_oi=total_pe_oi,
+            total_ce_volume=total_ce_volume,
+            total_pe_volume=total_pe_volume,
+            ce_oi_change_pct=ce_oi_change_pct,
+            pe_oi_change_pct=pe_oi_change_pct,
+            ce_volume_change_pct=ce_volume_change_pct,
+            pe_volume_change_pct=pe_volume_change_pct,
             pcr=pcr,
-            resistance_strike=int(resistance_strike),
-            support_strike=int(support_strike),
-            max_call_oi=int(max_ce_oi),
-            max_put_oi=int(max_pe_oi),
-            total_call_oi=int(total_ce_oi),
-            total_put_oi=int(total_pe_oi),
-            timestamp=datetime.now(IST).isoformat()
+            overall_sentiment=sentiment
         )
 
-# ==================== AI ANALYZER ====================
+class ChartAnalyzer:
+    """Advanced chart pattern analysis"""
+    
+    @staticmethod
+    def identify_market_structure(df: pd.DataFrame) -> Dict:
+        """Identify market structure (HH-HL, LH-LL, Sideways)"""
+        try:
+            if len(df) < 20:
+                return {"structure": "INSUFFICIENT", "bias": "NEUTRAL"}
+            
+            recent = df.tail(50)
+            highs = recent['high'].values
+            lows = recent['low'].values
+            
+            swing_highs = []
+            swing_lows = []
+            
+            for i in range(5, len(recent) - 5):
+                if all(highs[i] >= highs[i-j] for j in range(1, 6)) and \
+                   all(highs[i] >= highs[i+j] for j in range(1, 6)):
+                    swing_highs.append(highs[i])
+                
+                if all(lows[i] <= lows[i-j] for j in range(1, 6)) and \
+                   all(lows[i] <= lows[i+j] for j in range(1, 6)):
+                    swing_lows.append(lows[i])
+            
+            if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+                if swing_highs[-1] > swing_highs[-2] and swing_lows[-1] > swing_lows[-2]:
+                    return {"structure": "HH_HL", "bias": "BULLISH"}
+                elif swing_highs[-1] < swing_highs[-2] and swing_lows[-1] < swing_lows[-2]:
+                    return {"structure": "LH_LL", "bias": "BEARISH"}
+            
+            return {"structure": "SIDEWAYS", "bias": "NEUTRAL"}
+        except:
+            return {"structure": "ERROR", "bias": "NEUTRAL"}
+    
+    @staticmethod
+    def calculate_support_resistance(df: pd.DataFrame) -> Dict:
+        """Calculate multi-touch support/resistance levels"""
+        try:
+            if len(df) < 50:
+                current = df['close'].iloc[-1]
+                return {
+                    'supports': [current * 0.98],
+                    'resistances': [current * 1.02]
+                }
+            
+            recent = df.tail(100)
+            current = recent['close'].iloc[-1]
+            
+            highs = recent['high'].values
+            lows = recent['low'].values
+            
+            resistance_levels = []
+            support_levels = []
+            
+            window = 5
+            for i in range(window, len(recent) - window):
+                if all(highs[i] >= highs[i-j] for j in range(1, window+1)) and \
+                   all(highs[i] >= highs[i+j] for j in range(1, window+1)):
+                    resistance_levels.append(highs[i])
+                
+                if all(lows[i] <= lows[i-j] for j in range(1, window+1)) and \
+                   all(lows[i] <= lows[i+j] for j in range(1, window+1)):
+                    support_levels.append(lows[i])
+            
+            def cluster(levels):
+                if not levels:
+                    return []
+                levels = sorted(levels)
+                clustered = []
+                current_cluster = [levels[0]]
+                for level in levels[1:]:
+                    if abs(level - current_cluster[-1]) / current_cluster[-1] < 0.005:
+                        current_cluster.append(level)
+                    else:
+                        clustered.append(np.mean(current_cluster))
+                        current_cluster = [level]
+                clustered.append(np.mean(current_cluster))
+                return clustered
+            
+            resistances = cluster(resistance_levels)
+            supports = cluster(support_levels)
+            
+            resistances = [r for r in resistances if 0.001 <= (r - current)/current <= 0.05]
+            supports = [s for s in supports if 0.001 <= (current - s)/current <= 0.05]
+            
+            return {
+                'supports': supports[:3] if supports else [current * 0.98],
+                'resistances': resistances[:3] if resistances else [current * 1.02]
+            }
+        except:
+            current = df['close'].iloc[-1]
+            return {
+                'supports': [current * 0.98],
+                'resistances': [current * 1.02]
+            }
+
 class AIAnalyzer:
+    """DeepSeek AI analysis - Two phase"""
+    
     @staticmethod
     def extract_json(content: str) -> Optional[Dict]:
         """Extract JSON from AI response"""
         try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            match = re.search(r'\{.*\}', content, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    pass
-
-        logger.error("Failed to extract JSON from AI response")
-        return None
-
+            try:
+                return json.loads(content)
+            except:
+                pass
+            
+            patterns = [
+                r'```json\s*(\{.*?\})\s*```',
+                r'```\s*(\{.*?\})\s*```',
+                r'(\{[^{]*?"opportunity".*?\})',
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, content, re.DOTALL)
+                if match:
+                    try:
+                        return json.loads(match.group(1))
+                    except:
+                        continue
+            
+            start_idx = content.find('{')
+            if start_idx != -1:
+                brace_count = 0
+                for i in range(start_idx, len(content)):
+                    if content[i] == '{':
+                        brace_count += 1
+                    elif content[i] == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            try:
+                                return json.loads(content[start_idx:i+1])
+                            except:
+                                break
+            
+            return None
+        except:
+            return None
+    
     @staticmethod
-    def validate_targets(
-        opportunity: str,
-        entry: float,
-        sl: float,
-        t1: float,
-        t2: float
-    ) -> bool:
-        """Validate target prices and R:R ratio"""
-
-        if opportunity == "WAIT":
-            return True
-
-        # Validate direction
-        if opportunity == "CE_BUY":
-            if not (t1 > entry > sl):
-                logger.warning(
-                    f"⚠️ Invalid CE_BUY levels: Entry={entry}, SL={sl}, T1={t1}"
-                )
-                return False
-            risk = entry - sl
-            reward = t1 - entry
-
-        elif opportunity == "PE_BUY":
-            if not (t1 < entry < sl):
-                logger.warning(
-                    f"⚠️ Invalid PE_BUY levels: Entry={entry}, SL={sl}, T1={t1}"
-                )
-                return False
-            risk = sl - entry
-            reward = entry - t1
-        else:
-            return False
-
-        # Check minimum R:R ratio
-        rr_ratio = reward / risk if risk > 0 else 0
-
-        if rr_ratio < 1.5:
-            logger.warning(
-                f"⚠️ Poor R:R ratio: {rr_ratio:.2f} (minimum 1:1.5 required)"
-            )
-            return False
-
-        logger.info(f"  ✅ Validation passed. R:R = {rr_ratio:.2f}")
-        return True
-
-    @staticmethod
-    def deep_analysis(
-        symbol: str,
-        mtf_data: MultiTimeframeData,
-        current_oi: KeyOIZones,
-        prev_oi: Optional[KeyOIZones],
-        news_data: Optional[NewsData]
-    ) -> Optional[DeepAnalysis]:
-        """Complete AI analysis with all data"""
-
+    def phase1_quick_scan(symbol: str, spot_price: float, aggregate: AggregateOIAnalysis) -> Optional[QuickAnalysis]:
+        """Phase 1: Quick analysis"""
         try:
-            # Prepare candlestick data
-            candle_df = mtf_data.df_15m.tail(500).reset_index()
-            candle_df['timestamp'] = candle_df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S')
-            candles_json = candle_df[
-                ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            ].to_json(orient='records')
-
-            # Build OI comparison section
-            now = datetime.now(IST)
-            comparison_period = "Market Opening" if now.time() < time(9, 45) else "30 Min Ago"
-
-            current_oi_text = f"""**CURRENT OI DATA:**
-- Resistance (Max Call OI): {current_oi.resistance_strike} (OI: {current_oi.max_call_oi:,})
-- Support (Max Put OI): {current_oi.support_strike} (OI: {current_oi.max_put_oi:,})
-- PCR: {current_oi.pcr}
-- Total Call OI: {current_oi.total_call_oi:,}
-- Total Put OI: {current_oi.total_put_oi:,}
-"""
-
-            if prev_oi:
-                resistance_change = current_oi.resistance_strike - prev_oi.resistance_strike
-                support_change = current_oi.support_strike - prev_oi.support_strike
-                pcr_change = current_oi.pcr - prev_oi.pcr
-
-                resistance_arrow = "↑" if resistance_change > 0 else "↓" if resistance_change < 0 else "→"
-                support_arrow = "↑" if support_change > 0 else "↓" if support_change < 0 else "→"
-
-                prev_oi_text = f"""**PREVIOUS OI DATA ({comparison_period}):**
-- Resistance: {prev_oi.resistance_strike} → {current_oi.resistance_strike} {resistance_arrow} (Change: {resistance_change})
-- Support: {prev_oi.support_strike} → {current_oi.support_strike} {support_arrow} (Change: {support_change})
-- PCR: {prev_oi.pcr} → {current_oi.pcr} (Change: {pcr_change:+.2f})
-
-**OI FLOW INTERPRETATION:**
-- Support moving UP + Price holding = Bullish strength
-- Resistance moving DOWN + Price weak = Bearish pressure
-- PCR > 1.2 = Bullish bias | PCR < 0.8 = Bearish bias
-"""
-            else:
-                prev_oi_text = f"**PREVIOUS OI DATA:** Not available yet (first scan)\n"
-
-            # News section
-            news_text = ""
-            if news_data:
-                news_text = f"""**NEWS CONTEXT:**
-- Headline: {news_data.headline}
-- Summary: {news_data.summary}
-"""
-
-            # Construct prompt
-            prompt = f"""You are an elite F&O trader analyzing {symbol} for intraday options trading on NSE/BSE.
-
-📊 **CANDLESTICK DATA (15min, Last 7 days):**
-{candles_json}
-
-💹 **CURRENT MARKET STATUS:**
-- Spot Price: ₹{mtf_data.spot_price:.2f}
-- Time: {datetime.now(IST).strftime('%d-%b %H:%M')}
-
-🔢 **OPTION INTEREST ANALYSIS:**
-
-{current_oi_text}
-
-{prev_oi_text}
-
-{news_text}
-
-🎯 **ANALYSIS REQUIREMENTS:**
-1. Identify chart patterns (Support/Resistance, trendlines, candlestick patterns)
-2. Analyze volume confirmation
-3. Interpret OI flow changes comprehensively
-4. Calculate precise entry/exit levels
-5. Consider news sentiment if applicable
-
-⚠️ **CRITICAL TRADING RULES:**
-- **CE_BUY:** target_1 > entry_price > stop_loss (upside trade)
-- **PE_BUY:** target_1 < entry_price < stop_loss (downside trade)
-- **Minimum R:R:** 1:1.5 (reward must be 1.5x the risk)
-- **Strike selection:** ATM or 1-2 strikes OTM for best liquidity
-- **confidence:** Be honest - only high confidence (75+) if setup is clear
-- **total_score:** Rate overall setup quality (0-100)
-
-📋 **OUTPUT FORMAT (JSON ONLY, NO OTHER TEXT):**
-{{
-  "chart_bias": "Bullish/Bearish/Neutral",
-  "market_structure": "Clear description of current price structure",
-  "pattern_signal": "Any chart patterns identified (e.g., 'Higher highs forming')",
-  "oi_flow_signal": "Detailed OI flow interpretation based on changes",
-  "opportunity": "CE_BUY/PE_BUY/WAIT",
-  "confidence": 85,
-  "total_score": 90,
-  "entry_price": {mtf_data.spot_price:.2f},
-  "stop_loss": 0.0,
-  "target_1": 0.0,
-  "target_2": 0.0,
-  "risk_reward": "1:2.5",
-  "recommended_strike": {round(mtf_data.spot_price/50)*50},
-  "support_levels": [0.0],
-  "resistance_levels": [0.0],
-  "risk_factors": ["List specific risks"]
-}}
-
-Respond with ONLY the JSON object, nothing else."""
-
-            # Call DeepSeek API
             url = "https://api.deepseek.com/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
                 "Content-Type": "application/json"
             }
+            
+            prompt = f"""Quick scan for {symbol} options.
+
+Spot: {spot_price:.2f}
+PCR: {aggregate.pcr:.2f}
+CE OI: {aggregate.ce_oi_change_pct:+.2f}%
+PE OI: {aggregate.pe_oi_change_pct:+.2f}%
+CE Vol: {aggregate.ce_volume_change_pct:+.2f}%
+PE Vol: {aggregate.pe_volume_change_pct:+.2f}%
+Sentiment: {aggregate.overall_sentiment}
+
+Reply JSON only:
+{{
+  "opportunity": "PE_BUY or CE_BUY or WAIT",
+  "confidence": 75,
+  "reason": "Brief reason"
+}}"""
 
             payload = {
                 "model": "deepseek-chat",
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an expert F&O trader. Respond in JSON only."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system", "content": "Quick trader. Reply JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 300
+            }
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=10)
+            
+            if response.status_code != 200:
+                return None
+            
+            result = response.json()
+            content = result['choices'][0]['message']['content'].strip()
+            
+            analysis_dict = AIAnalyzer.extract_json(content)
+            
+            if not analysis_dict:
+                return None
+            
+            opportunity = analysis_dict.get('opportunity', 'WAIT')
+            confidence = analysis_dict.get('confidence', 0)
+            
+            # Calculate metrics
+            oi_divergence = abs(aggregate.pe_oi_change_pct - aggregate.ce_oi_change_pct)
+            
+            if opportunity == "PE_BUY":
+                volume_surge = aggregate.pe_volume_change_pct
+            elif opportunity == "CE_BUY":
+                volume_surge = aggregate.ce_volume_change_pct
+            else:
+                volume_surge = 0
+            
+            # Phase 1 filter
+            passed = (
+                confidence >= PHASE1_CONFIDENCE_MIN and
+                oi_divergence >= PHASE1_OI_DIVERGENCE_MIN and
+                volume_surge >= PHASE1_VOLUME_MIN and
+                opportunity != "WAIT"
+            )
+            
+            return QuickAnalysis(
+                opportunity=opportunity,
+                confidence=confidence,
+                oi_divergence=oi_divergence,
+                volume_surge=volume_surge,
+                pcr=aggregate.pcr,
+                passed_phase1=passed,
+                reason=analysis_dict.get('reason', 'N/A')
+            )
+            
+        except Exception as e:
+            logger.error(f"Phase 1 error: {e}")
+            return None
+    
+    @staticmethod
+    def phase2_deep_analysis(symbol: str, spot_price: float, df: pd.DataFrame,
+                            aggregate: AggregateOIAnalysis, structure: Dict, sr_levels: Dict) -> Optional[DeepAnalysis]:
+        """Phase 2: Deep analysis"""
+        try:
+            url = "https://api.deepseek.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            
+            prompt = f"""DEEP analysis for {symbol} F&O.
+
+Spot: {spot_price:.2f}
+
+STRUCTURE: {structure['structure']} | {structure['bias']}
+
+SUPPORT: {', '.join([f"{s:.0f}" for s in sr_levels['supports'][:3]])}
+RESISTANCE: {', '.join([f"{r:.0f}" for r in sr_levels['resistances'][:3]])}
+
+OPTIONS:
+PCR: {aggregate.pcr:.2f}
+CE: {aggregate.ce_oi_change_pct:+.2f}% | Vol: {aggregate.ce_volume_change_pct:+.2f}%
+PE: {aggregate.pe_oi_change_pct:+.2f}% | Vol: {aggregate.pe_volume_change_pct:+.2f}%
+
+Score /125:
+- Chart: /50
+- Options: /50
+- Alignment: /25
+
+Reply JSON:
+{{
+  "opportunity": "PE_BUY or CE_BUY",
+  "confidence": 78,
+  "chart_score": 40,
+  "option_score": 42,
+  "alignment_score": 20,
+  "total_score": 102,
+  "entry_price": {spot_price:.2f},
+  "stop_loss": {spot_price * 0.995:.2f},
+  "target_1": {spot_price * 1.01:.2f},
+  "target_2": {spot_price * 1.02:.2f},
+  "risk_reward": "1:2",
+  "recommended_strike": {int(spot_price)},
+  "pattern_signal": "Pattern detail",
+  "oi_flow_signal": "OI flow detail",
+  "market_structure": "{structure['structure']}",
+  "support_levels": {sr_levels['supports'][:2]},
+  "resistance_levels": {sr_levels['resistances'][:2]},
+  "scenario_bullish": "If breaks X",
+  "scenario_bearish": "If breaks Y",
+  "risk_factors": ["Risk1", "Risk2"],
+  "monitoring_checklist": ["Check1", "Check2"]
+}}"""
+
+            payload = {
+                "model": "deepseek-chat",
+                "messages": [
+                    {"role": "system", "content": "Expert F&O trader. Reply JSON only with detailed analysis."},
+                    {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.3,
-                "max_tokens": 2000
+                "max_tokens": 1500
             }
-
-            logger.info("🧠 Sending data to AI for analysis...")
-            response = requests.post(url, json=payload, headers=headers, timeout=60)
-
+            
+            response = requests.post(url, json=payload, headers=headers, timeout=45)
+            
             if response.status_code != 200:
-                logger.error(f"AI API error: {response.status_code} - {response.text}")
                 return None
-
-            # Extract analysis
-            ai_content = response.json()['choices'][0]['message']['content']
-            analysis_dict = AIAnalyzer.extract_json(ai_content)
-
+            
+            result = response.json()
+            content = result['choices'][0]['message']['content'].strip()
+            
+            analysis_dict = AIAnalyzer.extract_json(content)
+            
             if not analysis_dict:
-                logger.error("Failed to parse AI response")
                 return None
-
-            logger.info(
-                f"  ✅ AI Response: {analysis_dict.get('opportunity')} | "
-                f"Confidence: {analysis_dict.get('confidence')}% | "
-                f"Score: {analysis_dict.get('total_score')}"
-            )
-
-            # Validate targets
-            opportunity = analysis_dict.get('opportunity', 'WAIT')
-            if opportunity != "WAIT":
-                if not AIAnalyzer.validate_targets(
-                    opportunity,
-                    analysis_dict.get('entry_price', 0),
-                    analysis_dict.get('stop_loss', 0),
-                    analysis_dict.get('target_1', 0),
-                    analysis_dict.get('target_2', 0)
-                ):
-                    logger.warning("  ❌ Validation failed, rejecting signal")
-                    return None
-
-            # Create analysis object
+            
+            required = ['opportunity', 'confidence', 'chart_score', 'option_score', 'alignment_score']
+            if not all(f in analysis_dict for f in required):
+                return None
+            
             return DeepAnalysis(
-                **analysis_dict,
-                news_sentiment=news_data.sentiment if news_data else "NEUTRAL",
-                news_impact=news_data.impact_score if news_data else 0
+                opportunity=analysis_dict['opportunity'],
+                confidence=analysis_dict['confidence'],
+                chart_score=analysis_dict['chart_score'],
+                option_score=analysis_dict['option_score'],
+                alignment_score=analysis_dict['alignment_score'],
+                total_score=analysis_dict.get('total_score', 
+                    analysis_dict['chart_score'] + analysis_dict['option_score'] + analysis_dict['alignment_score']),
+                entry_price=analysis_dict.get('entry_price', spot_price),
+                stop_loss=analysis_dict.get('stop_loss', spot_price * 0.995),
+                target_1=analysis_dict.get('target_1', spot_price * 1.01),
+                target_2=analysis_dict.get('target_2', spot_price * 1.02),
+                risk_reward=analysis_dict.get('risk_reward', '1:2'),
+                recommended_strike=analysis_dict.get('recommended_strike', int(spot_price)),
+                pattern_signal=analysis_dict.get('pattern_signal', 'N/A'),
+                oi_flow_signal=analysis_dict.get('oi_flow_signal', 'N/A'),
+                market_structure=analysis_dict.get('market_structure', structure['structure']),
+                support_levels=analysis_dict.get('support_levels', sr_levels['supports'][:2]),
+                resistance_levels=analysis_dict.get('resistance_levels', sr_levels['resistances'][:2]),
+                scenario_bullish=analysis_dict.get('scenario_bullish', 'N/A'),
+                scenario_bearish=analysis_dict.get('scenario_bearish', 'N/A'),
+                risk_factors=analysis_dict.get('risk_factors', ['See analysis']),
+                monitoring_checklist=analysis_dict.get('monitoring_checklist', ['Monitor price'])
             )
-
+            
         except Exception as e:
-            logger.error(f"AI analysis error: {e}")
-            traceback.print_exc()
+            logger.error(f"Phase 2 error: {e}")
             return None
 
-# ==================== CHART GENERATOR ====================
-class ChartGenerator:
-    @staticmethod
-    def create_chart(
-        mtf_data: MultiTimeframeData,
-        symbol: str,
-        analysis: DeepAnalysis,
-        current_oi: KeyOIZones,
-        prev_oi: Optional[KeyOIZones]
-    ) -> Optional[io.BytesIO]:
-        """Generate trading chart with analysis"""
-
-        try:
-            df_plot = mtf_data.df_15m.tail(120).copy()
-
-            fig, (ax1, ax2) = plt.subplots(
-                2, 1,
-                figsize=(18, 11),
-                gridspec_kw={'height_ratios': [3, 1]},
-                facecolor='white'
-            )
-
-            # Plot candlesticks
-            for i, row in enumerate(df_plot.itertuples()):
-                color = '#26a69a' if row.close >= row.open else '#ef5350'
-
-                # Wick
-                ax1.plot([i, i], [row.low, row.high], color=color, linewidth=1.2)
-
-                # Body
-                ax1.add_patch(Rectangle(
-                    (i - 0.35, min(row.open, row.close)),
-                    0.7,
-                    abs(row.close - row.open),
-                    facecolor=color,
-                    edgecolor=color
-                ))
-
-            # OI levels
-            ax1.axhline(
-                y=current_oi.support_strike,
-                color='#2196F3',
-                linestyle='-.',
-                linewidth=2,
-                alpha=0.8,
-                label=f'OI Support: {current_oi.support_strike}'
-            )
-
-            ax1.axhline(
-                y=current_oi.resistance_strike,
-                color='#9C27B0',
-                linestyle='-.',
-                linewidth=2,
-                alpha=0.8,
-                label=f'OI Resistance: {current_oi.resistance_strike}'
-            )
-
-            # Current price line
-            ax1.axhline(
-                y=mtf_data.spot_price,
-                color='#FF6B00',
-                linestyle='-',
-                linewidth=2.5,
-                label=f'CMP: {mtf_data.spot_price:.1f}'
-            )
-
-            # Entry, SL, Targets
-            if analysis.opportunity != "WAIT":
-                ax1.axhline(
-                    y=analysis.entry_price,
-                    color='#4CAF50',
-                    linestyle='--',
-                    linewidth=1.5,
-                    alpha=0.7,
-                    label=f'Entry: {analysis.entry_price:.1f}'
-                )
-
-                ax1.axhline(
-                    y=analysis.stop_loss,
-                    color='#F44336',
-                    linestyle='--',
-                    linewidth=1.5,
-                    alpha=0.7,
-                    label=f'SL: {analysis.stop_loss:.1f}'
-                )
-
-                ax1.axhline(
-                    y=analysis.target_1,
-                    color='#00E676',
-                    linestyle='--',
-                    linewidth=1.5,
-                    alpha=0.7,
-                    label=f'T1: {analysis.target_1:.1f}'
-                )
-
-            # OI change indicator
-            if prev_oi:
-                oi_change_text = (
-                    f"OI Flow: Support {prev_oi.support_strike}→{current_oi.support_strike} | "
-                    f"Resistance {prev_oi.resistance_strike}→{current_oi.resistance_strike} | "
-                    f"PCR {prev_oi.pcr}→{current_oi.pcr}"
-                )
-
-                ax1.text(
-                    0.02, 0.98,
-                    oi_change_text,
-                    transform=ax1.transAxes,
-                    fontsize=9,
-                    verticalalignment='top',
-                    bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8)
-                )
-
-            # Chart title
-            title = (
-                f'{symbol} | 15min | {analysis.chart_bias} | '
-                f'Confidence: {analysis.confidence}% | Score: {analysis.total_score}/100'
-            )
-            ax1.set_title(title, fontsize=14, fontweight='bold', pad=15)
-
-            ax1.set_ylabel('Price (₹)', fontsize=12, fontweight='bold')
-            ax1.legend(loc='upper left', fontsize=9)
-            ax1.grid(True, linestyle='--', linewidth=0.4, alpha=0.5)
-            ax1.tick_params(axis='x', bottom=False, labelbottom=False)
-
-            # Volume bars
-            vol_colors = [
-                '#26a69a' if row.close >= row.open else '#ef5350'
-                for row in df_plot.itertuples()
-            ]
-
-            ax2.bar(range(len(df_plot)), df_plot['volume'], color=vol_colors, alpha=0.7)
-            ax2.set_ylabel('Volume', fontsize=11, fontweight='bold')
-            ax2.set_xlabel('Time', fontsize=11)
-            ax2.grid(True, linestyle='--', linewidth=0.3, alpha=0.4)
-
-            plt.tight_layout(pad=2.0)
-
-            # Save to buffer
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-            buf.seek(0)
-            plt.close(fig)
-
-            return buf
-
-        except Exception as e:
-            logger.error(f"Chart generation error: {e}")
-            traceback.print_exc()
-            return None
-
-# ==================== TELEGRAM NOTIFIER ====================
 class TelegramNotifier:
-    def __init__(self, api_status: Dict):
+    """Telegram message sender"""
+    
+    def __init__(self):
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        self.api_status = api_status
-
+    
     async def send_startup_message(self):
         """Send bot startup notification"""
         try:
-            status_emojis = {
-                'upstox': '🟢' if self.api_status.get('upstox') else '🔴',
-                'redis': '🟢' if self.api_status.get('redis') else '🟡',
-                'finnhub': '🟢' if self.api_status.get('finnhub') else '🟡',
-                'deepseek': '🟢' if self.api_status.get('deepseek') else '🔴'
-            }
+            msg = f"""🔥 HYBRID TRADING BOT v11.0 - ACTIVE 🔥
 
-            msg = f"""🚀 **HYBRID TRADING BOT v19.0 - HOLIDAY AWARE** 🚀
+{'='*40}
+DATA SOURCE: Upstox API
+AI ENGINE: DeepSeek V3
+{'='*40}
 
-**📡 API STATUS:**
-{status_emojis['upstox']} Upstox API
-{status_emojis['redis']} Redis Cache (OI Tracking)
-{status_emojis['finnhub']} Finnhub News
-{status_emojis['deepseek']} DeepSeek AI
+📊 Monitoring:
+   • {len(INDICES)} Indices
+   • {len(SELECTED_STOCKS)} Stocks
 
-**📊 TRACKING:**
-- NIFTY 50 (Tuesday Weekly) - Auto-adjusts for holidays
-- SENSEX (Thursday Weekly) - Auto-adjusts for holidays
+⏰ Scan Interval: 15 minutes
 
-**⚙️ CONFIGURATION:**
-- Scan Interval: {SCAN_INTERVAL//60} minutes
-- Min Confidence: {CONFIDENCE_MIN}%
-- Min Score: {SCORE_MIN}/100
-- Signal Cooldown: {SIGNAL_COOLDOWN//60} mins
+{'='*40}
+TWO-PHASE ANALYSIS
+{'='*40}
 
-**🧠 ANALYSIS ENGINE:**
-✅ Raw candlestick analysis (15min)
-✅ Smart OI zones with flow comparison
-✅ 30-min OI snapshot tracking
-✅ Market news integration
-✅ AI-powered signal generation
+PHASE 1: QUICK SCAN
+✅ All instruments (5 sec each)
+✅ Filters:
+   - Confidence ≥70%
+   - OI Divergence ≥2.5%
+   - Volume ≥25%
 
-**🎯 NEW IN v19.0:**
-✅ Holiday-aware expiry calculation
-✅ Automatic expiry day adjustment
-✅ NSE trading calendar integration
-✅ Prepone/postpone logic for holidays
+PHASE 2: DEEP ANALYSIS
+✅ Promising only
+✅ Advanced analysis:
+   - Market structure
+   - Multi-touch S/R
+   - Confluence scoring
+✅ Filters:
+   - Confidence ≥75%
+   - Score ≥90/125
+   - Alignment ≥18/25
 
-**📝 MODE:** Paper Trading Ready
-
-Bot is now scanning... 🔍"""
-
+{'='*40}
+Status: 🟢 RUNNING
+Market: 9:15 AM - 3:30 PM IST
+{'='*40}"""
+            
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
+                text=msg
             )
-
-            logger.info("✅ Startup message sent to Telegram")
-
+            logger.info("Startup message sent!")
         except Exception as e:
-            logger.error(f"Telegram startup message error: {e}")
-
-    async def send_alert(
-        self,
-        symbol: str,
-        analysis: DeepAnalysis,
-        mtf: MultiTimeframeData,
-        current_oi: KeyOIZones,
-        prev_oi: Optional[KeyOIZones],
-        expiry: str,
-        index_info: Dict
-    ):
-        """Send trading alert with chart"""
+            logger.error(f"Startup message error: {e}")
+    
+    async def send_alert(self, symbol: str, spot_price: float, analysis: DeepAnalysis, 
+                        aggregate: AggregateOIAnalysis, expiry: str):
+        """Send trading alert"""
         try:
-            # Signal emoji
             signal_map = {
-                "CE_BUY": "🟢 CALL BUY",
-                "PE_BUY": "🔴 PUT BUY",
-                "WAIT": "⚪ NO TRADE"
+                "PE_BUY": ("🟢", "PE BUY (Bullish)"),
+                "CE_BUY": ("🔴", "CE BUY (Bearish)")
             }
-            signal = signal_map.get(analysis.opportunity, "⚪ WAIT")
+            
+            signal_emoji, signal_text = signal_map.get(analysis.opportunity, ("⚪", "WAIT"))
+            
+            ist_time = datetime.now(IST).strftime('%H:%M:%S')
+            
+            # Main alert
+            alert = f"""🎯 TRADING SIGNAL - {symbol}
 
-            # Parse expiry date to show day
-            expiry_date = datetime.strptime(expiry, '%Y-%m-%d')
-            expiry_display = expiry_date.strftime('%d-%b-%Y (%A)')
+{signal_emoji} {signal_text}
 
-            # Build alert message
-            alert = f"""🎯 **{index_info['display_name']} SIGNAL** 🎯
+{'='*40}
+CONFIDENCE: {analysis.confidence}%
+SCORE: {analysis.total_score}/125
+   Chart: {analysis.chart_score}/50
+   Options: {analysis.option_score}/50
+   Alignment: {analysis.alignment_score}/25
 
-**{signal}**
+{'='*40}
+TRADE SETUP
+{'='*40}
+💰 Spot: ₹{spot_price:.2f}
+📍 Entry: ₹{analysis.entry_price:.2f}
+🛑 Stop Loss: ₹{analysis.stop_loss:.2f}
+🎯 Target 1: ₹{analysis.target_1:.2f}
+🎯 Target 2: ₹{analysis.target_2:.2f}
+📊 Risk:Reward: {analysis.risk_reward}
+🎲 Strike: {analysis.recommended_strike}
 
-━━━━━━━━━━━━━━━━━━━━
-**📊 ANALYSIS:**
-- **Market Bias:** {analysis.chart_bias}
-- **Confidence:** {analysis.confidence}%
-- **Quality Score:** {analysis.total_score}/100
-- **Structure:** {analysis.market_structure}
+{'='*40}
+MARKET STRUCTURE
+{'='*40}
+{analysis.market_structure}
 
-**🔢 OI INSIGHTS:**
-- **Current PCR:** {current_oi.pcr}
-- **Support Level:** {current_oi.support_strike} (OI: {current_oi.max_put_oi:,})
-- **Resistance Level:** {current_oi.resistance_strike} (OI: {current_oi.max_call_oi:,})
-- **OI Flow:** {analysis.oi_flow_signal}
+Support: {', '.join([f"₹{s:.1f}" for s in analysis.support_levels[:2]])}
+Resistance: {', '.join([f"₹{r:.1f}" for r in analysis.resistance_levels[:2]])}
 
-━━━━━━━━━━━━━━━━━━━━
-**💰 TRADE SETUP:**
+{'='*40}
+OPTIONS DATA
+{'='*40}
+PCR: {aggregate.pcr:.2f}
+CE OI: {aggregate.ce_oi_change_pct:+.1f}% | Vol: {aggregate.ce_volume_change_pct:+.1f}%
+PE OI: {aggregate.pe_oi_change_pct:+.1f}% | Vol: {aggregate.pe_volume_change_pct:+.1f}%
 
-📍 **Entry:** `{analysis.entry_price:.2f}`
-🛑 **Stop Loss:** `{analysis.stop_loss:.2f}`
-🎯 **Target 1:** `{analysis.target_1:.2f}`
-🎯 **Target 2:** `{analysis.target_2:.2f}`
-📊 **Risk:Reward:** {analysis.risk_reward}
+{'='*40}
+SIGNALS
+{'='*40}
+📊 Chart: {analysis.pattern_signal[:150]}
 
-**📝 RECOMMENDED OPTION:**
-- **Strike:** {analysis.recommended_strike}
-- **Expiry:** {expiry_display}
-- **Lot Size:** {index_info['lot_size']}
+⛓️ OI Flow: {analysis.oi_flow_signal[:150]}
 
-━━━━━━━━━━━━━━━━━━━━
-**⚠️ RISK FACTORS:**
-"""
+{'='*40}
+SCENARIOS
+{'='*40}
+🟢 Bullish: {analysis.scenario_bullish[:150]}
 
-            for risk in analysis.risk_factors:
-                alert += f"• {risk}\n"
+🔴 Bearish: {analysis.scenario_bearish[:150]}
 
-            if analysis.news_sentiment != "NEUTRAL":
-                alert += f"\n**📰 News Sentiment:** {analysis.news_sentiment}"
-
-            alert += f"""
-
-━━━━━━━━━━━━━━━━━━━━
-⏰ *Signal Time: {datetime.now(IST).strftime('%d %b %Y, %H:%M:%S IST')}*
-📌 *CMP: {mtf.spot_price:.2f}*
-
-_This is for paper trading. Trade at your own risk._"""
-
-            # Generate chart
-            chart = ChartGenerator.create_chart(
-                mtf, symbol, analysis, current_oi, prev_oi
-            )
-
-            # Send alert
-            if chart:
-                await self.bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=chart,
-                    caption=alert,
-                    parse_mode='Markdown'
-                )
-            else:
-                await self.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=alert,
-                    parse_mode='Markdown'
-                )
-
-            logger.info(f"✅ Alert sent for {symbol}: {analysis.opportunity}")
-
-        except Exception as e:
-            logger.error(f"Telegram alert error: {e}")
-            traceback.print_exc()
-
-    async def send_error_notification(self, error_msg: str):
-        """Send error notification"""
-        try:
-            msg = f"⚠️ **BOT ERROR**\n\n`{error_msg}`"
+{'='*40}
+RISK FACTORS
+{'='*40}"""
+            
+            for i, risk in enumerate(analysis.risk_factors[:3], 1):
+                alert += f"\n⚠️ {risk[:100]}"
+            
+            alert += f"\n\n{'='*40}\nMONITORING CHECKLIST\n{'='*40}"
+            
+            for i, check in enumerate(analysis.monitoring_checklist[:3], 1):
+                alert += f"\n✓ {check[:100]}"
+            
+            alert += f"\n\n{'='*40}"
+            alert += f"\n📅 Expiry: {expiry}"
+            alert += f"\n⏰ Time: {ist_time} IST"
+            alert += f"\n🤖 AI: DeepSeek V3 | v11.0"
+            alert += f"\n{'='*40}"
+            
             await self.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
-                text=msg,
-                parse_mode='Markdown'
+                text=alert
+            )
+            
+            logger.info(f"Alert sent: {symbol} - {analysis.opportunity}")
+            
+        except Exception as e:
+            logger.error(f"Alert error: {e}")
+    
+    async def send_cycle_summary(self, phase1_count: int, phase1_passed: int, 
+                                 phase2_count: int, alerts_sent: int):
+        """Send scan cycle summary"""
+        try:
+            msg = f"""📊 SCAN CYCLE COMPLETE
+
+Phase 1: {phase1_passed}/{phase1_count} passed
+Phase 2: {phase2_count} analyzed
+Alerts: {alerts_sent} sent
+
+⏰ Next scan in 15 minutes..."""
+            
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=msg
             )
         except Exception as e:
-            logger.error(f"Error notification failed: {e}")
+            logger.error(f"Summary error: {e}")
 
-# ==================== MAIN BOT CLASS ====================
-class HybridBot:
+class HybridTradingBot:
+    """Main bot orchestrator"""
+    
     def __init__(self):
-        logger.info("="*60)
-        logger.info("Initializing Hybrid Trading Bot v19.0 (Holiday-Aware)...")
-        logger.info("="*60)
-
-        # Initialize components
-        self.redis = RedisCache()
+        logger.info("Initializing Hybrid Trading Bot v11.0...")
         self.fetcher = UpstoxDataFetcher()
-        self.finnhub = FinnhubNewsAPI()
         self.oi_analyzer = OIAnalyzer()
+        self.chart_analyzer = ChartAnalyzer()
         self.ai_analyzer = AIAnalyzer()
-
-        # API status
-        api_status = {
-            'upstox': self.fetcher.connected,
-            'redis': self.redis.connected,
-            'finnhub': self.finnhub.connected,
-            'deepseek': bool(DEEPSEEK_API_KEY)
-        }
-
-        self.notifier = TelegramNotifier(api_status)
-
-        # Signal tracking
-        self.last_signals = {}  # Track last signal time per symbol
-
-        logger.info("✅ Bot initialized successfully!")
-        logger.info("="*60)
-
+        self.notifier = TelegramNotifier()
+        
+        self.phase1_scanned = 0
+        self.phase1_passed = 0
+        self.phase2_analyzed = 0
+        self.alerts_sent = 0
+        
+        logger.info("Bot v11.0 initialized!")
+    
     def is_market_open(self) -> bool:
-        """Check if market is currently open"""
-        now = datetime.now(IST)
-
-        # Weekend check
-        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        """Check if market is open"""
+        now_ist = datetime.now(IST)
+        current_time = now_ist.strftime("%H:%M")
+        
+        if now_ist.weekday() >= 5:  # Weekend
             return False
-
-        # Holiday check
-        date_str = now.strftime('%Y-%m-%d')
-        if date_str in NSE_HOLIDAYS_2025:
-            logger.info(f"🚫 Today ({date_str}) is a market holiday")
-            return False
-
-        # Market hours: 9:15 AM to 3:30 PM IST
-        market_start = time(9, 15)
-        market_end = time(15, 30)
-
-        return market_start <= now.time() <= market_end
-
-    async def scan_indices(self):
-        """Main scanning function for all indices"""
-
-        logger.info("\n" + "="*60)
-        logger.info(f"SCAN CYCLE STARTED @ {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}")
-        logger.info("="*60)
-
-        # Fetch market news once per cycle
-        market_news = self.finnhub.get_market_news()
-
-        # Scan each index
-        for instrument_key, index_info in INDICES.items():
+        
+        return "09:15" <= current_time <= "15:30"
+    
+    async def phase1_quick_scan(self, instruments: Dict) -> List[Tuple[str, str, QuickAnalysis, AggregateOIAnalysis, str]]:
+        """Phase 1: Quick scan all instruments"""
+        promising = []
+        
+        logger.info("\n" + "="*70)
+        logger.info(f"PHASE 1: QUICK SCAN ({len(instruments)} instruments)")
+        logger.info("="*70)
+        
+        for idx, (key, info) in enumerate(instruments.items(), 1):
             try:
-                symbol = index_info['name']
-                display_name = index_info['display_name']
-
-                logger.info(f"\n🔍 Analyzing {display_name}...")
-                logger.info("-" * 40)
-
-                # Step 1: Fetch candlestick data
-                logger.info("  📊 Fetching candlestick data...")
-                mtf = self.fetcher.get_candlestick_data(instrument_key)
-
-                if not mtf or mtf.df_15m.empty or mtf.spot_price == 0:
-                    logger.warning(f"  ❌ No market data available for {symbol}")
+                self.phase1_scanned += 1
+                
+                if isinstance(info, dict) and 'name' in info:
+                    symbol = info['name']
+                    expiry_day = info.get('expiry_day', 3)
+                else:
+                    symbol = info
+                    expiry_day = 3
+                
+                logger.info(f"[{idx}/{len(instruments)}] Quick scan: {symbol}")
+                
+                # Get spot price
+                spot_price = self.fetcher.get_spot_price(key)
+                if spot_price == 0:
+                    logger.warning(f"{symbol}: No spot price")
                     continue
-
-                logger.info(f"  ✅ Spot Price: ₹{mtf.spot_price:.2f}")
-
-                # Step 2: Get smart expiry (holiday-aware)
-                logger.info("  📅 Calculating expiry (holiday-aware)...")
-                expiry = self.fetcher.get_next_expiry(
-                    instrument_key,
-                    index_info['preferred_expiry_day'],
-                    symbol
-                )
-
-                expiry_date = datetime.strptime(expiry, '%Y-%m-%d')
-                logger.info(f"  ✅ Using expiry: {expiry} ({expiry_date.strftime('%A')})")
-
-                # Step 3: Fetch option chain
-                logger.info("  🔢 Fetching option chain...")
-                strikes = self.fetcher.get_option_chain(instrument_key, expiry)
-
-                if not strikes:
-                    logger.warning(f"  ❌ No option chain data for {symbol}")
+                
+                # Get expiry
+                expiry = self.fetcher.get_next_expiry(key, expiry_day)
+                
+                # Get option chain
+                strikes = self.fetcher.get_option_chain(key, expiry)
+                if not strikes or len(strikes) < 10:
+                    logger.warning(f"{symbol}: Insufficient option data")
                     continue
-
-                # Analyze OI
-                logger.info("  🔢 Analyzing Open Interest...")
-                current_oi = self.oi_analyzer.get_key_oi_zones(strikes, mtf.spot_price)
-
-                logger.info(f"  ✅ OI Data: PCR={current_oi.pcr}, "
-                            f"Support={current_oi.support_strike}, "
-                            f"Resistance={current_oi.resistance_strike}")
-
-                # Get previous OI for comparison
-                current_oi, prev_oi = self.redis.store_and_get_oi_snapshots(
-                    symbol, current_oi
-                )
-
-                # Step 4: Filter relevant news
-                news_data = NewsAnalyzer.filter_and_analyze_news(symbol, market_news)
-
-                if news_data:
-                    logger.info(f"  📰 Relevant news found: {news_data.headline[:50]}...")
-
-                # Step 5: AI Deep Analysis
-                logger.info("  🧠 Requesting AI analysis...")
-                deep = self.ai_analyzer.deep_analysis(
-                    symbol, mtf, current_oi, prev_oi, news_data
-                )
-
-                if not deep:
-                    logger.info("  ⚪ No actionable signal from AI")
+                
+                # Parse OI data
+                oi_data = self.oi_analyzer.parse_option_chain(strikes, spot_price)
+                if not oi_data:
                     continue
-
-                logger.info(
-                    f"  ✅ AI Analysis Complete:\n"
-                    f"      • Signal: {deep.opportunity}\n"
-                    f"      • Bias: {deep.chart_bias}\n"
-                    f"      • Confidence: {deep.confidence}%\n"
-                    f"      • Score: {deep.total_score}/100"
-                )
-
-                # Step 6: Check thresholds and cooldown
-                if deep.opportunity == "WAIT":
-                    logger.info("  ⚪ AI suggests WAIT - No trade setup")
+                
+                # Get aggregate analysis
+                aggregate = self.oi_analyzer.get_aggregate_analysis(symbol, oi_data)
+                if not aggregate:
                     continue
-
-                if deep.confidence < CONFIDENCE_MIN:
-                    logger.info(
-                        f"  ⚠️ Confidence too low ({deep.confidence}% < {CONFIDENCE_MIN}%)"
-                    )
-                    continue
-
-                if deep.total_score < SCORE_MIN:
-                    logger.info(
-                        f"  ⚠️ Score too low ({deep.total_score} < {SCORE_MIN})"
-                    )
-                    continue
-
-                # Check signal cooldown
-                now = datetime.now(IST)
-                last_signal_time = self.last_signals.get(
-                    symbol,
-                    datetime.min.replace(tzinfo=IST)
-                )
-
-                time_since_last = (now - last_signal_time).total_seconds()
-
-                if time_since_last < SIGNAL_COOLDOWN:
-                    remaining = int((SIGNAL_COOLDOWN - time_since_last) / 60)
-                    logger.info(
-                        f"  ⏳ Signal cooldown active. "
-                        f"Wait {remaining} more minutes."
-                    )
-                    continue
-
-                # Step 7: Send alert
-                logger.info(f"  🚀 HIGH CONFIDENCE SIGNAL DETECTED!")
-                logger.info(f"  📤 Sending alert to Telegram...")
-
-                await self.notifier.send_alert(
-                    symbol, deep, mtf, current_oi, prev_oi, expiry, index_info
-                )
-
-                # Update last signal time
-                self.last_signals[symbol] = now
-
-                logger.info(f"  ✅ Alert sent successfully!")
-
-                # Small delay between alerts
-                await asyncio.sleep(3)
-
+                
+                # Quick AI analysis
+                quick = self.ai_analyzer.phase1_quick_scan(symbol, spot_price, aggregate)
+                
+                if quick and quick.passed_phase1:
+                    self.phase1_passed += 1
+                    promising.append((key, symbol, quick, aggregate, expiry))
+                    logger.info(f"✅ {symbol}: PASSED (Conf: {quick.confidence}%, Div: {quick.oi_divergence:.1f}%)")
+                else:
+                    logger.info(f"❌ {symbol}: Failed Phase 1")
+                
+                await asyncio.sleep(0.5)
+                
             except Exception as e:
-                logger.error(f"❌ Error scanning {instrument_key}: {e}")
-                traceback.print_exc()
-
-                # Send error notification
-                await self.notifier.send_error_notification(
-                    f"Error scanning {instrument_key}: {str(e)[:100]}"
+                logger.error(f"Phase 1 error {key}: {e}")
+        
+        logger.info(f"\nPhase 1 Complete: {self.phase1_passed}/{self.phase1_scanned} passed")
+        
+        return promising
+    
+    async def phase2_deep_analysis(self, promising: List[Tuple[str, str, QuickAnalysis, AggregateOIAnalysis, str]]):
+        """Phase 2: Deep analysis on promising instruments"""
+        
+        if not promising:
+            logger.info("No instruments passed Phase 1")
+            return
+        
+        logger.info("\n" + "="*70)
+        logger.info(f"PHASE 2: DEEP ANALYSIS ({len(promising)} promising)")
+        logger.info("="*70)
+        
+        for idx, (key, symbol, quick, aggregate, expiry) in enumerate(promising, 1):
+            try:
+                self.phase2_analyzed += 1
+                
+                logger.info(f"\n[{idx}/{len(promising)}] Deep analysis: {symbol}")
+                
+                # Get candle data
+                df = self.fetcher.get_candle_data(key, symbol)
+                if df is None or len(df) < 30:
+                    logger.warning(f"{symbol}: Insufficient chart data")
+                    continue
+                
+                spot_price = df['close'].iloc[-1]
+                
+                # Chart analysis
+                structure = self.chart_analyzer.identify_market_structure(df)
+                sr_levels = self.chart_analyzer.calculate_support_resistance(df)
+                
+                logger.info(f"{symbol}: {structure['structure']} | {structure['bias']}")
+                
+                # Deep AI analysis
+                deep = self.ai_analyzer.phase2_deep_analysis(
+                    symbol, spot_price, df, aggregate, structure, sr_levels
                 )
-
-            # Delay between indices
-            await asyncio.sleep(2)
-
-        logger.info("\n" + "="*60)
-        logger.info("SCAN CYCLE COMPLETED")
-        logger.info("="*60)
-
+                
+                if not deep:
+                    logger.warning(f"{symbol}: No deep analysis")
+                    continue
+                
+                logger.info(f"{symbol}: Score={deep.total_score}/125")
+                
+                # Phase 2 filters
+                if deep.confidence < PHASE2_CONFIDENCE_MIN:
+                    logger.info(f"❌ {symbol}: Confidence {deep.confidence}% < {PHASE2_CONFIDENCE_MIN}%")
+                    continue
+                
+                if deep.total_score < PHASE2_SCORE_MIN:
+                    logger.info(f"❌ {symbol}: Score {deep.total_score} < {PHASE2_SCORE_MIN}")
+                    continue
+                
+                if deep.alignment_score < PHASE2_ALIGNMENT_MIN:
+                    logger.info(f"❌ {symbol}: Alignment {deep.alignment_score} < {PHASE2_ALIGNMENT_MIN}")
+                    continue
+                
+                # Time filter (skip opening/closing)
+                now_ist = datetime.now(IST)
+                hour = now_ist.hour
+                minute = now_ist.minute
+                
+                if hour == 9 and minute < 25:
+                    logger.info(f"❌ {symbol}: Opening period")
+                    continue
+                
+                if hour == 15 or (hour == 14 and minute >= 40):
+                    logger.info(f"❌ {symbol}: Closing period")
+                    continue
+                
+                logger.info(f"✅ {symbol}: PASSED Phase 2 - Sending alert!")
+                
+                # Send alert
+                await self.notifier.send_alert(symbol, spot_price, deep, aggregate, expiry)
+                
+                self.alerts_sent += 1
+                
+                await asyncio.sleep(2)
+                
+            except Exception as e:
+                logger.error(f"Phase 2 error {symbol}: {e}")
+                logger.error(traceback.format_exc())
+    
+    async def run_scan_cycle(self):
+        """Run complete scan cycle"""
+        logger.info(f"\n{'='*70}")
+        logger.info(f"SCAN CYCLE START - {datetime.now(IST).strftime('%H:%M:%S IST')}")
+        logger.info(f"{'='*70}")
+        
+        # Reset counters
+        self.phase1_scanned = 0
+        self.phase1_passed = 0
+        self.phase2_analyzed = 0
+        alerts_before = self.alerts_sent
+        
+        # Combine all instruments
+        all_instruments = {**INDICES, **SELECTED_STOCKS}
+        
+        # Phase 1: Quick scan
+        promising = await self.phase1_quick_scan(all_instruments)
+        
+        # Phase 2: Deep analysis
+        await self.phase2_deep_analysis(promising)
+        
+        # Send summary
+        alerts_this_cycle = self.alerts_sent - alerts_before
+        await self.notifier.send_cycle_summary(
+            self.phase1_scanned, self.phase1_passed,
+            self.phase2_analyzed, alerts_this_cycle
+        )
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"CYCLE COMPLETE")
+        logger.info(f"Phase 1: {self.phase1_passed}/{self.phase1_scanned}")
+        logger.info(f"Phase 2: {self.phase2_analyzed}")
+        logger.info(f"Alerts: {alerts_this_cycle}")
+        logger.info(f"{'='*70}\n")
+    
     async def run(self):
         """Main bot loop"""
-
+        logger.info("="*70)
+        logger.info("HYBRID TRADING BOT v11.0")
+        logger.info("="*70)
+        
+        # Check credentials
+        missing = []
+        for cred in ['UPSTOX_ACCESS_TOKEN', 'TELEGRAM_BOT_TOKEN', 
+                     'TELEGRAM_CHAT_ID', 'DEEPSEEK_API_KEY']:
+            if not globals().get(cred):
+                missing.append(cred)
+        
+        if missing:
+            logger.error(f"Missing credentials: {', '.join(missing)}")
+            return
+        
         # Send startup message
         await self.notifier.send_startup_message()
-
-        logger.info("\n🟢 Bot is now running...\n")
-
+        
+        logger.info("="*70)
+        logger.info("Bot RUNNING - Hybrid two-phase analysis")
+        logger.info("="*70)
+        
         while True:
             try:
-                if self.is_market_open():
-                    # Market is open - scan indices
-                    await self.scan_indices()
-
-                    # Wait for next scan
-                    logger.info(
-                        f"\n⏳ Waiting {SCAN_INTERVAL//60} minutes "
-                        f"until next scan...\n"
-                    )
-                    await asyncio.sleep(SCAN_INTERVAL)
-
-                else:
-                    # Market is closed
-                    now = datetime.now(IST)
-                    logger.info(
-                        f"💤 Market closed. Current time: {now.strftime('%H:%M:%S')} | "
-                        f"Checking again in 1 minute..."
-                    )
+                if not self.is_market_open():
+                    logger.info("Market closed. Waiting...")
                     await asyncio.sleep(60)
-
+                    continue
+                
+                # Run scan cycle
+                await self.run_scan_cycle()
+                
+                # Wait for next cycle
+                logger.info(f"Next scan in {SCAN_INTERVAL // 60} minutes...")
+                await asyncio.sleep(SCAN_INTERVAL)
+                
             except KeyboardInterrupt:
-                logger.info("\n🛑 Bot stopped by user (Ctrl+C)")
+                logger.info("Stopped by user")
                 break
-
             except Exception as e:
-                logger.error(f"❌ Main loop error: {e}")
-                traceback.print_exc()
-
-                # Send error notification
-                await self.notifier.send_error_notification(
-                    f"Main loop error: {str(e)[:100]}"
-                )
-
-                # Wait before retry
-                logger.info("⏳ Waiting 60 seconds before retry...")
+                logger.error(f"Loop error: {e}")
+                logger.error(traceback.format_exc())
                 await asyncio.sleep(60)
 
-# ==================== ENTRY POINT ====================
 async def main():
-    """Main entry point"""
-
-    # Validate environment variables
-    required_vars = [
-        ('UPSTOX_ACCESS_TOKEN', UPSTOX_ACCESS_TOKEN),
-        ('TELEGRAM_BOT_TOKEN', TELEGRAM_BOT_TOKEN),
-        ('TELEGRAM_CHAT_ID', TELEGRAM_CHAT_ID),
-        ('DEEPSEEK_API_KEY', DEEPSEEK_API_KEY),
-        ('FINNHUB_API_KEY', FINNHUB_API_KEY)
-    ]
-
-    missing_vars = [name for name, value in required_vars if not value]
-
-    if missing_vars:
-        logger.critical(
-            f"❌ CRITICAL ERROR: Missing environment variables: "
-            f"{', '.join(missing_vars)}"
-        )
-        logger.critical("Please set all required environment variables and restart.")
-        return
-
-    # Start bot
-    logger.info("🚀 Starting Hybrid Trading Bot v19.0 (Holiday-Aware)...")
-    bot = HybridBot()
-    await bot.run()
+    """Entry point"""
+    try:
+        bot = HybridTradingBot()
+        await bot.run()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
+    logger.info("="*70)
+    logger.info("HYBRID TRADING BOT v11.0 STARTING...")
+    logger.info("Upstox + DeepSeek AI + Two-Phase Filter")
+    logger.info("="*70)
+    
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("\n👋 Bot shutdown complete. Goodbye!")
+        logger.info("\nShutdown (Ctrl+C)")
     except Exception as e:
-        logger.critical(f"❌ Fatal error: {e}")
-        traceback.print_exc()
+        logger.error(f"\nCritical error: {e}")
+        logger.error(traceback.format_exc())
