@@ -5,7 +5,7 @@ H-LIQUIDITY WALT (High-Liquidity Weighted Average Long Term)
 ✅ Pre-Market: 8:55 AM (Historical Analysis)
 ✅ Live Scan: 9:16 AM - 3:30 PM (Every 5 minutes)
 ✅ DeepSeek V3 AI Analysis
-✅ Redis Data Storage (1-day expiry)
+✅ Redis Data Storage (1-day expiry) - FIXED CONNECTION
 ✅ Active Filter (Volume/OI threshold)
 ✅ Chart Generation (5-Min TF)
 ✅ Telegram Alerts + P&L Tracking
@@ -54,11 +54,8 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 
-# Redis Configuration - Use REDIS_URL or individual params
-REDIS_URL = os.getenv('REDIS_URL')  # e.g., redis://username:password@host:port/db
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
-REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', None)
+# Redis Configuration - ONLY REDIS_URL
+REDIS_URL = os.getenv('REDIS_URL')  # Format: redis://username:password@host:port/db
 
 BASE_URL = "https://api.upstox.com"
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
@@ -176,8 +173,8 @@ class StrikeData:
 
 @dataclass
 class TradeDecision:
-    decision: str  # BUY_CALL, BUY_PUT, NO_TRADE
-    confidence: int  # 1-5
+    decision: str
+    confidence: int
     entry_price: float
     stop_loss: float
     target_1: float
@@ -186,21 +183,33 @@ class TradeDecision:
     stop_hunt_risk: int
     clarity_score: int
 
-# ==================== REDIS MANAGER ====================
+# ==================== REDIS MANAGER (FIXED) ====================
 class RedisManager:
     def __init__(self):
         try:
-            self.redis = redis.Redis(
-                host=REDIS_HOST,
-                port=REDIS_PORT,
-                password=REDIS_PASSWORD,
+            if not REDIS_URL:
+                logger.error("❌ REDIS_URL environment variable not set!")
+                sys.exit(1)
+            
+            # Parse REDIS_URL and connect
+            self.redis = redis.from_url(
+                REDIS_URL,
                 decode_responses=True,
-                socket_timeout=5
+                socket_timeout=10,
+                socket_connect_timeout=10
             )
+            
+            # Test connection
             self.redis.ping()
-            logger.info("✅ Redis connected")
-        except Exception as e:
+            logger.info("✅ Redis connected successfully")
+            logger.info(f"   Redis URL: {REDIS_URL[:20]}...")  # Log partial URL for security
+            
+        except redis.ConnectionError as e:
             logger.error(f"❌ Redis connection failed: {e}")
+            logger.error(f"   Check REDIS_URL format: redis://[user]:[password]@[host]:[port]/[db]")
+            sys.exit(1)
+        except Exception as e:
+            logger.error(f"❌ Redis initialization error: {e}")
             sys.exit(1)
     
     def set_with_expiry(self, key: str, value: str, expiry_seconds: int = 86400):
@@ -208,14 +217,14 @@ class RedisManager:
         try:
             self.redis.setex(key, expiry_seconds, value)
         except Exception as e:
-            logger.error(f"Redis SET error: {e}")
+            logger.error(f"Redis SET error for key '{key}': {e}")
     
     def get(self, key: str) -> Optional[str]:
         """Retrieve data"""
         try:
             return self.redis.get(key)
         except Exception as e:
-            logger.error(f"Redis GET error: {e}")
+            logger.error(f"Redis GET error for key '{key}': {e}")
             return None
     
     def delete(self, key: str):
@@ -223,14 +232,14 @@ class RedisManager:
         try:
             self.redis.delete(key)
         except Exception as e:
-            logger.error(f"Redis DELETE error: {e}")
+            logger.error(f"Redis DELETE error for key '{key}': {e}")
     
     def cleanup_expired(self):
         """Force cleanup expired keys"""
         try:
             for key in self.redis.scan_iter("*"):
                 ttl = self.redis.ttl(key)
-                if ttl == -1:  # No expiry set
+                if ttl == -1:
                     self.redis.expire(key, 86400)
             logger.info("✅ Redis cleanup complete")
         except Exception as e:
@@ -412,7 +421,6 @@ class ActiveFilter:
     def is_active(instrument_key: str, symbol_info: Dict, fetcher: UpstoxDataFetcher) -> bool:
         """Check if instrument is active based on volume/OI"""
         try:
-            # Get last 7 days data for volume check
             candles = fetcher.get_historical_1min(instrument_key, days=7)
             if not candles:
                 return False
@@ -421,11 +429,9 @@ class ActiveFilter:
             df['value'] = df['close'] * df['volume']
             avg_daily_value = df['value'].sum() / 7
             
-            # Check volume threshold
             if avg_daily_value < VOLUME_THRESHOLD:
                 return False
             
-            # Check OI change (if F&O stock)
             if 'oi' in df.columns and len(df) > 1:
                 oi_change_pct = abs((df['oi'].iloc[-1] - df['oi'].iloc[0]) / df['oi'].iloc[0] * 100)
                 if oi_change_pct < OI_CHANGE_THRESHOLD:
@@ -648,13 +654,11 @@ TODAY: [TRADE: Entry[X] SL[Y] ⭐[X/5]] OR [WAIT: Trigger + Level]
     def parse_response(self, content: str) -> Optional[Dict]:
         """Parse AI response to extract trade decision"""
         try:
-            # Try to extract JSON from response
             import re
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
             
-            # Fallback: Parse text response
             decision = "NO_TRADE"
             if "BUY_CALL" in content or "LONG CE" in content:
                 decision = "BUY_CALL"
@@ -697,7 +701,6 @@ class ChartGenerator:
         ax1.set_facecolor(BG)
         df_plot = df.reset_index(drop=True)
         
-        # Candlesticks
         for idx, row in df_plot.iterrows():
             color = GREEN if row['close'] > row['open'] else RED
             ax1.plot([idx+0.3, idx+0.3], [row['low'], row['high']],
@@ -711,21 +714,18 @@ class ChartGenerator:
                 alpha=0.85
             ))
         
-        # Highlight last candle
         last_idx = len(df_plot) - 1
         last_close = df_plot.iloc[-1]['close']
         ax1.scatter([last_idx + 0.3], [last_close],
                    color=YELLOW, s=250, marker='D', zorder=10,
                    edgecolors=TEXT, linewidths=2, alpha=0.9)
         
-        # Current price line
         ax1.axhline(spot, color=ORANGE, linewidth=2, linestyle='--', alpha=0.7)
         ax1.text(2, spot, f' Spot: ₹{spot:.2f}',
                 color=ORANGE, fontsize=10, fontweight='bold',
                 bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
                          alpha=0.9, edgecolor=ORANGE, linewidth=1.5))
         
-        # Trade setup lines (if trade decision)
         if decision['decision'] != 'NO_TRADE':
             entry = decision.get('entry_price', 0)
             sl = decision.get('stop_loss', 0)
@@ -746,7 +746,6 @@ class ChartGenerator:
                 ax1.text(len(df_plot) - 5, t1, f' T1: ₹{t1:.2f}',
                         color=GREEN, fontsize=9, fontweight='bold')
         
-        # Category emoji
         category_emoji = {
             "INDEX": "📈", "AUTO": "🚗", "BANK": "🏦", "METAL": "🏭",
             "OIL_GAS": "⛽", "IT": "💻", "PHARMA": "💊", "FMCG": "🛒",
@@ -754,7 +753,6 @@ class ChartGenerator:
             "TELECOM": "📱", "FINANCE": "💰"
         }.get(category, "📊")
         
-        # Title
         direction = decision.get('decision', 'NO_TRADE').replace('_', ' ')
         confidence = '⭐' * decision.get('confidence', 0)
         title = f"{category_emoji} {symbol} | {direction} | {confidence}"
@@ -763,7 +761,6 @@ class ChartGenerator:
         ax1.tick_params(colors=TEXT)
         ax1.set_ylabel('Price (₹)', color=TEXT, fontsize=11, fontweight='bold')
         
-        # Volume
         ax2.set_facecolor(BG)
         colors = [GREEN if df_plot.iloc[i]['close'] > df_plot.iloc[i]['open'] else RED
                  for i in range(len(df_plot))]
@@ -804,14 +801,11 @@ class TelegramNotifier:
                               chart_path: str, expiry: str):
         """Send trade alert with chart"""
         try:
-            # Send chart
             with open(chart_path, 'rb') as photo:
                 await self.bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photo)
             
-            # PCR calculation
             pcr = OIAnalyzer.calculate_pcr(strikes)
             
-            # Build alert message
             category_emoji = {
                 "INDEX": "📈", "AUTO": "🚗", "BANK": "🏦", "METAL": "🏭",
                 "OIL_GAS": "⛽", "IT": "💻", "PHARMA": "💊", "FMCG": "🛒",
@@ -852,7 +846,6 @@ Stop Hunt Risk: {decision['stop_hunt_risk']}%
             
             await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
             
-            # Log trade
             self.trade_log.append({
                 'timestamp': datetime.now(IST).isoformat(),
                 'symbol': symbol,
@@ -913,39 +906,33 @@ class PreMarketEngine:
             
             logger.info(f"  📊 Pre-Market: {display_name}")
             
-            # Fetch 7-days historical data
             candles_1min = self.fetcher.get_historical_1min(instrument_key, days=7)
             if not candles_1min:
                 logger.warning(f"    ❌ No historical data")
                 return False
             
-            # Aggregate to timeframes
             df_5m, df_15m, df_1h = DataAggregator.prepare_dataframes(candles_1min)
             
             if df_1h.empty or df_15m.empty:
                 logger.warning(f"    ❌ Aggregation failed")
                 return False
             
-            # Get spot price
             spot = self.fetcher.get_spot_price(instrument_key)
             if spot == 0:
                 logger.warning(f"    ❌ No spot price")
                 return False
             
-            # Prepare compressed historical summary
             last_10_1h = df_1h.tail(10)
             summary_1h = "\n".join([
                 f"{row.name.strftime('%H:%M')}|{row['open']:.2f}|{row['high']:.2f}|{row['low']:.2f}|{row['close']:.2f}|{int(row['volume'])}|{int(row['oi'])}"
                 for _, row in last_10_1h.iterrows()
             ])
             
-            # Calculate key S/R levels (simple high/low)
             support_1 = df_15m['low'].tail(50).min()
             support_2 = df_15m['low'].tail(100).min()
             resistance_1 = df_15m['high'].tail(50).max()
             resistance_2 = df_15m['high'].tail(100).max()
             
-            # Build pre-market prompt
             prompt = f"""INSTRUMENT: {symbol_name}
 SPOT: ₹{spot:.2f}
 
@@ -965,11 +952,9 @@ Resistance: {resistance_1:.2f}, {resistance_2:.2f}
 
 Output JSON format."""
             
-            # Get AI analysis
             analysis = self.deepseek.analyze(prompt)
             
             if analysis:
-                # Store in Redis
                 historical_data = {
                     'trend_1h': 'BULLISH' if df_1h['close'].iloc[-1] > df_1h['close'].iloc[-5] else 'BEARISH',
                     'support': [float(support_1), float(support_2)],
@@ -983,19 +968,9 @@ Output JSON format."""
                     json.dumps(historical_data)
                 )
                 
-                # Store aggregated candles
-                self.redis.set_with_expiry(
-                    f"CANDLES_1H_{symbol_name}",
-                    df_1h.to_json()
-                )
-                self.redis.set_with_expiry(
-                    f"CANDLES_15M_{symbol_name}",
-                    df_15m.to_json()
-                )
-                self.redis.set_with_expiry(
-                    f"CANDLES_5M_{symbol_name}",
-                    df_5m.to_json()
-                )
+                self.redis.set_with_expiry(f"CANDLES_1H_{symbol_name}", df_1h.to_json())
+                self.redis.set_with_expiry(f"CANDLES_15M_{symbol_name}", df_15m.to_json())
+                self.redis.set_with_expiry(f"CANDLES_5M_{symbol_name}", df_5m.to_json())
                 
                 logger.info(f"    ✅ Analysis stored")
                 return True
@@ -1013,7 +988,6 @@ Output JSON format."""
         logger.info(f"🔄 PRE-MARKET ANALYSIS - {datetime.now(IST).strftime('%H:%M:%S IST')}")
         logger.info(f"{'='*80}")
         
-        # Process in batches of 10
         items = list(symbols.items())
         batch_size = 10
         success_count = 0
@@ -1030,7 +1004,6 @@ Output JSON format."""
             results = await asyncio.gather(*tasks, return_exceptions=True)
             success_count += sum(1 for r in results if r is True)
             
-            # Small delay between batches
             if i + batch_size < len(items):
                 await asyncio.sleep(2)
         
@@ -1061,7 +1034,6 @@ class LiveScanner:
             logger.info(f"🔍 {display_name}")
             logger.info(f"{'='*70}")
             
-            # Get current spot price
             spot = self.fetcher.get_spot_price(instrument_key)
             if spot == 0:
                 logger.warning(f"  ❌ No spot price")
@@ -1069,18 +1041,15 @@ class LiveScanner:
             
             logger.info(f"  💹 Spot: ₹{spot:.2f}")
             
-            # Get expiry
             expiry = ExpiryCalculator.get_best_expiry(
                 instrument_key, symbol_info, self.fetcher.headers
             )
             
-            # Fetch last 5-min intraday data
             candles_intraday = self.fetcher.get_intraday_1min(instrument_key)
             if not candles_intraday:
                 logger.warning(f"  ⚠️ No intraday data")
                 return
             
-            # Get stored historical data from Redis
             candles_5m_json = self.redis.get(f"CANDLES_5M_{symbol_name}")
             candles_15m_json = self.redis.get(f"CANDLES_15M_{symbol_name}")
             
@@ -1091,17 +1060,14 @@ class LiveScanner:
             df_5m_historical = pd.read_json(candles_5m_json)
             df_15m_historical = pd.read_json(candles_15m_json)
             
-            # Append today's data
             df_intraday = pd.DataFrame(candles_intraday, 
                                       columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
             df_intraday['timestamp'] = pd.to_datetime(df_intraday['timestamp'])
             df_intraday = df_intraday.set_index('timestamp').astype(float).sort_index()
             
-            # Aggregate today's data
             df_5m_today = DataAggregator.aggregate_to_timeframe(df_intraday, '5min', 100)
             df_15m_today = DataAggregator.aggregate_to_timeframe(df_intraday, '15min', 100)
             
-            # Combine historical + today
             df_5m = pd.concat([df_5m_historical, df_5m_today]).tail(50)
             df_15m = pd.concat([df_15m_historical, df_15m_today]).tail(175)
             
@@ -1111,7 +1077,6 @@ class LiveScanner:
             
             logger.info(f"  📊 Candles: 5M={len(df_5m)}, 15M={len(df_15m)}")
             
-            # Get option chain
             all_strikes = self.fetcher.get_option_chain(instrument_key, expiry)
             if not all_strikes:
                 logger.warning(f"  ⚠️ No option chain")
@@ -1119,25 +1084,21 @@ class LiveScanner:
             
             atm_strikes = OIAnalyzer.get_atm_strikes(all_strikes, spot, count=21)
             
-            # Calculate metrics
             pcr = OIAnalyzer.calculate_pcr(atm_strikes)
             max_pain = OIAnalyzer.calculate_max_pain(atm_strikes, spot)
             iv_delta = OIAnalyzer.calculate_iv_delta(atm_strikes, self.redis, symbol_name)
             
             logger.info(f"  📊 PCR: {pcr:.3f} | Max Pain: {max_pain} | IV Δ: {iv_delta:.1f}%")
             
-            # Get historical analysis from Redis
             historical_json = self.redis.get(f"HISTORICAL_ANALYSIS_{symbol_name}")
             historical_data = json.loads(historical_json) if historical_json else {}
             
-            # Build incremental prompt (last 3 candles + summary)
             last_3_15m = df_15m.tail(3)
             candle_summary = "\n".join([
                 f"{row.name.strftime('%H:%M')}|{row['open']:.2f}|{row['high']:.2f}|{row['low']:.2f}|{row['close']:.2f}|{int(row['volume'])}|{int(row['oi'])}"
                 for _, row in last_3_15m.iterrows()
             ])
             
-            # OI comparison (simplified - using ATM strikes)
             total_ce_oi = sum(s.ce_oi for s in atm_strikes)
             total_pe_oi = sum(s.pe_oi for s in atm_strikes)
             
@@ -1167,7 +1128,6 @@ Session: {'Opening' if datetime.now(IST).hour < 11 else 'Power Hour' if datetime
 - If Clarity Score > 60 AND Risk <= MEDIUM AND Stop Hunt Risk < 60% → BUY_CALL or BUY_PUT
 - Else → NO_TRADE"""
             
-            # Get AI decision
             logger.info(f"  🤖 Analyzing...")
             decision = self.deepseek.analyze(prompt)
             
@@ -1177,16 +1137,13 @@ Session: {'Opening' if datetime.now(IST).hour < 11 else 'Power Hour' if datetime
             
             logger.info(f"  📊 Decision: {decision['decision']} | Score: {decision['clarity_score']}/100")
             
-            # Check if trade signal
             if decision['decision'] in ['BUY_CALL', 'BUY_PUT']:
                 if decision['clarity_score'] >= 60 and decision['stop_hunt_risk'] < 60:
-                    # Generate chart
                     chart_path = f"/tmp/{symbol_name}_trade_{self.scan_count}.png"
                     ChartGenerator.create_trade_chart(
                         display_name, df_5m, spot, decision, category, chart_path
                     )
                     
-                    # Send alert
                     await self.notifier.send_trade_alert(
                         symbol_name, display_name, category, spot,
                         decision, atm_strikes, chart_path, expiry
@@ -1210,26 +1167,20 @@ Session: {'Opening' if datetime.now(IST).hour < 11 else 'Power Hour' if datetime
         logger.info(f"🔄 SCAN #{self.scan_count} - {datetime.now(IST).strftime('%H:%M:%S IST')}")
         logger.info(f"{'='*80}")
         
-        # Filter active instruments
         logger.info("📊 Filtering active instruments...")
         active_instruments = []
         
         for key, info in symbols.items():
-            # For demo, treat all as active (you can enable filter)
-            # is_active = ActiveFilter.is_active(key, info, self.fetcher)
-            is_active = True  # Simplified for now
-            
+            is_active = True  # Simplified - enable ActiveFilter.is_active() for production
             if is_active:
                 active_instruments.append((key, info))
         
         logger.info(f"  ✅ Active: {len(active_instruments)}/{len(symbols)}")
         
-        # Analyze each active instrument
         for idx, (key, info) in enumerate(active_instruments, 1):
             logger.info(f"\n[{idx}/{len(active_instruments)}]")
             await self.analyze_instrument(key, info)
             
-            # Small delay to avoid rate limits
             if idx < len(active_instruments):
                 await asyncio.sleep(1)
         
@@ -1284,12 +1235,11 @@ class HLiquidityWALT:
             try:
                 now = datetime.now(IST)
                 
-                # Pre-market phase (8:55-9:10 AM)
                 if self.should_run_pre_market() and not pre_market_done:
                     logger.info("\n🌅 PRE-MARKET PHASE")
                     success = await self.pre_market.run_parallel_analysis(ALL_SYMBOLS)
                     
-                    if success > len(ALL_SYMBOLS) * 0.7:  # 70% success rate
+                    if success > len(ALL_SYMBOLS) * 0.7:
                         pre_market_done = True
                         await self.notifier.bot.send_message(
                             chat_id=TELEGRAM_CHAT_ID,
@@ -1300,26 +1250,20 @@ class HLiquidityWALT:
                             f"⚠️ Pre-Market Incomplete: {success}/{len(ALL_SYMBOLS)}"
                         )
                 
-                # Reset pre-market flag after market close
                 if now.time() > time(15, 30):
                     pre_market_done = False
                 
-                # Live scanning phase (9:16 AM - 3:30 PM, every 5 min)
                 if self.is_market_open() and pre_market_done:
-                    if now.minute % 5 == 1 or now.minute % 5 == 0:  # Run at X:00, X:05, X:10, etc.
+                    if now.minute % 5 == 1 or now.minute % 5 == 0:
                         await self.scanner.run_scan(ALL_SYMBOLS)
-                        
-                        # Wait to next 5-min mark
                         await asyncio.sleep(SCAN_INTERVAL)
                     else:
                         await asyncio.sleep(30)
                 
-                # After market close - send daily summary
                 if now.time() == time(15, 35):
                     await self.notifier.send_daily_summary()
                     await asyncio.sleep(60)
                 
-                # Market closed or waiting
                 if not self.is_market_open() and not self.should_run_pre_market():
                     logger.info("⏸️ Market closed. Waiting...")
                     await asyncio.sleep(300)
@@ -1343,7 +1287,7 @@ async def daily_cleanup_task(redis: RedisManager):
                 logger.info("\n🧹 Running daily cleanup...")
                 redis.cleanup_expired()
                 logger.info("✅ Cleanup complete")
-                await asyncio.sleep(3600)  # Wait 1 hour
+                await asyncio.sleep(3600)
             else:
                 await asyncio.sleep(60)
         except Exception as e:
@@ -1354,13 +1298,8 @@ async def daily_cleanup_task(redis: RedisManager):
 async def main():
     try:
         bot = HLiquidityWALT()
-        
-        # Start cleanup task in background
         cleanup_task = asyncio.create_task(daily_cleanup_task(bot.redis))
-        
-        # Run main bot
         await bot.run()
-        
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         traceback.print_exc()
