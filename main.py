@@ -794,7 +794,11 @@ class TelegramNotifier:
 
 🟢 **SYSTEM ACTIVE**"""
         
-        await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
+        try:
+            await self.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
+            logger.info("✅ Startup message sent to Telegram")
+        except Exception as e:
+            logger.error(f"❌ Telegram startup message failed: {e}")
     
     async def send_trade_alert(self, symbol: str, display_name: str, category: str,
                               spot: float, decision: Dict, strikes: List[StrikeData],
