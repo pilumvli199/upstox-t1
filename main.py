@@ -54,8 +54,8 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 
-# Redis Configuration (Railway.app support)
-REDIS_URL = os.getenv('REDIS_URL')  # Railway.app format: redis://default:password@host:port
+# Redis Configuration - Use REDIS_URL or individual params
+REDIS_URL = os.getenv('REDIS_URL')  # e.g., redis://username:password@host:port/db
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 REDIS_PASSWORD = os.getenv('REDIS_PASSWORD', None)
