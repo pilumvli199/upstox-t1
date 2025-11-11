@@ -61,6 +61,8 @@ NIFTY_DISPLAY = "NIFTY50"
 # Analysis Configuration
 CANDLE_COUNT = 420  # Total candles for analysis
 TIMEFRAME = "5minute"  # Only 5-minute timeframe
+MARKET_START_TIME = time(9, 15)  # Market starts at 9:15 AM
+MARKET_END_TIME = time(15, 30)  # Market ends at 3:30 PM
 
 # ==================== DATA CLASSES ====================
 @dataclass
@@ -726,7 +728,7 @@ class ChartGenerator:
         spot_price: float,
         save_path: str
     ):
-        """Generate professional chart with signal visualization"""
+        """Generate professional chart with signal visualization - ALIGNED WITH LIVE MARKET"""
         
         BG = '#131722'
         GRID = '#1e222d'
@@ -744,7 +746,17 @@ class ChartGenerator:
         )
         
         ax1.set_facecolor(BG)
-        df_plot = df_5m.tail(200).reset_index(drop=True)  # Show last 200 candles on chart
+        
+        # Use last 200 candles for chart display
+        df_plot = df_5m.tail(200).copy()
+        df_plot = df_plot.reset_index(drop=True)
+        
+        # Extract time labels for x-axis (show every 10th candle)
+        time_labels = []
+        time_positions = []
+        for idx in range(0, len(df_plot), 10):
+            time_labels.append(df_plot.iloc[idx]['timestamp'].strftime('%H:%M'))
+            time_positions.append(idx)
         
         # Draw candlesticks
         for idx, row in df_plot.iterrows():
@@ -873,12 +885,34 @@ Reason: {signal.reasoning[:100]}..."""
             family='monospace'
         )
         
+        # Add timestamp footer showing current time and last candle time
+        last_candle_time = df_plot.iloc[-1]['timestamp'].strftime('%H:%M')
+        current_time = datetime.now(IST).strftime('%H:%M:%S')
+        footer_text = f"Last Candle: {last_candle_time} | Generated: {current_time}"
+        
+        ax1.text(
+            0.99, 0.01,
+            footer_text,
+            transform=ax1.transAxes,
+            fontsize=8,
+            ha='right',
+            va='bottom',
+            bbox=dict(boxstyle='round', facecolor=GRID, alpha=0.8),
+            color=TEXT,
+            family='monospace'
+        )
+        
         title = f"NIFTY50 | 5-Minute Timeframe | {signal.signal_type} | Score: {signal.alignment_score}/10"
         ax1.set_title(title, color=TEXT, fontsize=14, fontweight='bold', pad=15)
+        
+        # Set x-axis labels with time
+        ax1.set_xticks(time_positions)
+        ax1.set_xticklabels(time_labels, rotation=45, ha='right')
         
         ax1.grid(True, color=GRID, alpha=0.3)
         ax1.tick_params(colors=TEXT)
         ax1.set_ylabel('Price (₹)', color=TEXT, fontsize=11)
+        ax1.set_xlabel('Time', color=TEXT, fontsize=11)
         
         # Volume subplot
         ax2.set_facecolor(BG)
@@ -887,6 +921,11 @@ Reason: {signal.reasoning[:100]}..."""
         ax2.set_ylabel('Volume', color=TEXT, fontsize=11)
         ax2.tick_params(colors=TEXT)
         ax2.grid(True, color=GRID, alpha=0.3)
+        
+        # Set x-axis labels for volume chart
+        ax2.set_xticks(time_positions)
+        ax2.set_xticklabels(time_labels, rotation=45, ha='right')
+        ax2.set_xlabel('Time', color=TEXT, fontsize=11)
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, facecolor=BG)
@@ -920,7 +959,7 @@ class Nifty50Bot:
 ✅ Timeframe: 5-Minute ONLY
 ✅ Analysis Candles: 420 (Historical + Live)
 ✅ Scan Interval: Every 5 minutes
-✅ Market Hours: 9:20 AM - 3:30 PM
+✅ Market Hours: 9:15 AM - 3:30 PM
 ✅ Expiry: {expiry_display} ({expiry}) - {days_left} days left
 
 🔧 ULTRA COMPRESSION:
@@ -1134,7 +1173,7 @@ Risk:Reward → {signal.risk_reward}
                 current_time = now.time()
                 
                 # Check market hours
-                if current_time < time(9, 20) or current_time > time(15, 30):
+                if current_time < MARKET_START_TIME or current_time > MARKET_END_TIME:
                     logger.info(f"⏸️ Market closed. Waiting... (Current: {current_time.strftime('%H:%M')})")
                     await asyncio.sleep(300)
                     continue
