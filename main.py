@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-NIFTY50 5-MINUTE SINGLE TIMEFRAME BOT - ULTRA COMPRESSED
-==========================================================
-✅ ONLY 5-Min Timeframe Analysis
-✅ 420 Candles (Historical + Live)
-✅ Ultra-Compressed Format for DeepSeek (85% Token Reduction)
-✅ Fixed LTP Fetching with Multiple Response Formats
-✅ Scan Interval: Every 5 minutes | Target: NIFTY50 Index Only
+NIFTY50 5-MINUTE SINGLE TIMEFRAME BOT - INTRADAY + HISTORICAL
+==============================================================
+✅ Separate Intraday + Historical API Fetching
+✅ Fixed Today's Live Data Issue
+✅ Enhanced Chart with Volume Display
+✅ API Connection Status Notifications
+✅ ATM Option Chain Data in Alerts
 """
 
 import os
@@ -59,10 +59,10 @@ NIFTY_NAME = "NIFTY"
 NIFTY_DISPLAY = "NIFTY50"
 
 # Analysis Configuration
-CANDLE_COUNT = 420  # Total candles for analysis
-TIMEFRAME = "5minute"  # Only 5-minute timeframe
-MARKET_START_TIME = time(9, 15)  # Market starts at 9:15 AM
-MARKET_END_TIME = time(15, 30)  # Market ends at 3:30 PM
+CANDLE_COUNT = 420
+TIMEFRAME = "5minute"
+MARKET_START_TIME = time(9, 15)
+MARKET_END_TIME = time(15, 30)
 
 # ==================== DATA CLASSES ====================
 @dataclass
@@ -106,6 +106,57 @@ class TradeSignal:
     support_levels: List[float]
     resistance_levels: List[float]
     pattern_detected: str
+
+# ==================== API CONNECTION CHECKER ====================
+class APIConnectionChecker:
+    @staticmethod
+    def check_upstox(access_token: str) -> Tuple[bool, str]:
+        """Check Upstox API connection"""
+        try:
+            headers = {"Authorization": f"Bearer {access_token}"}
+            response = requests.get(
+                "https://api.upstox.com/v2/user/profile",
+                headers=headers,
+                timeout=10
+            )
+            if response.status_code == 200:
+                return True, "✅ Connected"
+            return False, f"❌ Error {response.status_code}"
+        except Exception as e:
+            return False, f"❌ Failed: {str(e)[:50]}"
+    
+    @staticmethod
+    def check_deepseek(api_key: str) -> Tuple[bool, str]:
+        """Check DeepSeek API connection"""
+        try:
+            response = requests.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 10
+                },
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                timeout=10
+            )
+            if response.status_code == 200:
+                return True, "✅ Connected"
+            return False, f"❌ Error {response.status_code}"
+        except Exception as e:
+            return False, f"❌ Failed: {str(e)[:50]}"
+    
+    @staticmethod
+    def check_redis(redis_url: str) -> Tuple[bool, str]:
+        """Check Redis connection"""
+        try:
+            client = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=5)
+            client.ping()
+            return True, "✅ Connected"
+        except Exception as e:
+            return False, f"❌ Failed: {str(e)[:50]}"
 
 # ==================== EXPIRY CALCULATOR ====================
 class ExpiryCalculator:
@@ -296,7 +347,7 @@ class RedisOIManager:
         
         return None
 
-# ==================== UPSTOX DATA FETCHER ====================
+# ==================== UPSTOX DATA FETCHER - FIXED ====================
 class UpstoxDataFetcher:
     def __init__(self, access_token: str):
         self.access_token = access_token
@@ -305,15 +356,15 @@ class UpstoxDataFetcher:
             "Accept": "application/json"
         }
     
-    def get_historical_data(self, days: int = 7) -> pd.DataFrame:
-        """Fetch 5-minute historical data"""
+    def get_intraday_data(self) -> pd.DataFrame:
+        """Fetch TODAY'S live 5-minute candles using Intraday API"""
         try:
-            to_date = datetime.now(IST)
-            from_date = to_date - timedelta(days=days)
-            
             encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
             
-            url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/5minute/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
+            # Intraday API - Today's live data
+            url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_symbol}/5minute"
+            
+            logger.info(f"  📥 Fetching TODAY's intraday data...")
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
@@ -325,77 +376,120 @@ class UpstoxDataFetcher:
                     )
                     df['timestamp'] = pd.to_datetime(df['timestamp'])
                     df = df.sort_values('timestamp').reset_index(drop=True)
-                    logger.info(f"  ✅ Fetched {len(df)} 5-minute candles")
+                    logger.info(f"  ✅ Fetched {len(df)} intraday candles (TODAY)")
                     return df
             
-            logger.warning(f"  ⚠️ Historical data API returned {response.status_code}")
+            logger.warning(f"  ⚠️ Intraday API returned {response.status_code}")
+            return pd.DataFrame()
+            
+        except Exception as e:
+            logger.error(f"  ❌ Intraday data error: {e}")
+            return pd.DataFrame()
+    
+    def get_historical_data(self, days: int = 3) -> pd.DataFrame:
+        """Fetch HISTORICAL 5-minute data (past days, excluding today)"""
+        try:
+            # Fetch data from 3 days ago to yesterday
+            to_date = (datetime.now(IST) - timedelta(days=1)).date()  # Yesterday
+            from_date = (datetime.now(IST) - timedelta(days=days)).date()
+            
+            encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
+            
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/5minute/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
+            
+            logger.info(f"  📥 Fetching historical data ({from_date} to {to_date})...")
+            response = requests.get(url, headers=self.headers, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and 'candles' in data['data']:
+                    df = pd.DataFrame(
+                        data['data']['candles'],
+                        columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi']
+                    )
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df = df.sort_values('timestamp').reset_index(drop=True)
+                    logger.info(f"  ✅ Fetched {len(df)} historical candles")
+                    return df
+            
+            logger.warning(f"  ⚠️ Historical API returned {response.status_code}")
             return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"  ❌ Historical data error: {e}")
             return pd.DataFrame()
     
+    def get_combined_data(self) -> pd.DataFrame:
+        """Combine Historical + Intraday data for complete picture"""
+        try:
+            # Step 1: Get historical data (past days)
+            df_historical = self.get_historical_data(days=3)
+            
+            # Step 2: Get today's intraday data
+            df_intraday = self.get_intraday_data()
+            
+            # Step 3: Combine both
+            if not df_historical.empty and not df_intraday.empty:
+                df_combined = pd.concat([df_historical, df_intraday])
+            elif not df_intraday.empty:
+                df_combined = df_intraday
+            elif not df_historical.empty:
+                df_combined = df_historical
+            else:
+                logger.error("  ❌ No data available from both APIs")
+                return pd.DataFrame()
+            
+            # Remove duplicates and sort
+            df_combined = df_combined.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+            
+            # Keep last 500 candles max
+            df_combined = df_combined.tail(500).reset_index(drop=True)
+            
+            first_time = df_combined.iloc[0]['timestamp'].strftime('%d-%b %H:%M')
+            last_time = df_combined.iloc[-1]['timestamp'].strftime('%d-%b %H:%M')
+            logger.info(f"  ✅ Combined: {len(df_combined)} candles ({first_time} to {last_time})")
+            
+            return df_combined
+            
+        except Exception as e:
+            logger.error(f"  ❌ Combined data error: {e}")
+            return pd.DataFrame()
+    
     def get_ltp(self) -> float:
-        """Get Last Traded Price - FIXED VERSION with multiple format support"""
+        """Get Last Traded Price"""
         try:
             encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
             url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={encoded_symbol}"
             response = requests.get(url, headers=self.headers, timeout=10)
             
-            logger.info(f"  📡 LTP API Status: {response.status_code}")
-            
             if response.status_code == 200:
                 data = response.json()
                 
-                response_preview = json.dumps(data, indent=2)[:500]
-                logger.info(f"  🔍 LTP Response Preview: {response_preview}")
-                
                 try:
-                    # Format 1: Standard nested format
                     if 'data' in data and NIFTY_SYMBOL in data['data']:
                         ltp = float(data['data'][NIFTY_SYMBOL]['last_price'])
-                        logger.info(f"  ✅ LTP (Format 1): ₹{ltp:.2f}")
+                        logger.info(f"  ✅ LTP: ₹{ltp:.2f}")
                         return ltp
                     
-                    # Format 2: Direct last_price in data
                     if 'data' in data and isinstance(data['data'], dict) and 'last_price' in data['data']:
                         ltp = float(data['data']['last_price'])
-                        logger.info(f"  ✅ LTP (Format 2): ₹{ltp:.2f}")
+                        logger.info(f"  ✅ LTP: ₹{ltp:.2f}")
                         return ltp
                     
-                    # Format 3: Array response
-                    if 'data' in data and isinstance(data['data'], list) and len(data['data']) > 0:
-                        if 'last_price' in data['data'][0]:
-                            ltp = float(data['data'][0]['last_price'])
-                            logger.info(f"  ✅ LTP (Format 3): ₹{ltp:.2f}")
-                            return ltp
-                    
-                    # Format 4: Nested in first key
                     if 'data' in data and isinstance(data['data'], dict):
                         first_key = list(data['data'].keys())[0] if data['data'] else None
                         if first_key and 'last_price' in data['data'][first_key]:
                             ltp = float(data['data'][first_key]['last_price'])
-                            logger.info(f"  ✅ LTP (Format 4): ₹{ltp:.2f}")
+                            logger.info(f"  ✅ LTP: ₹{ltp:.2f}")
                             return ltp
                     
-                    # Format 5: Root level
-                    if 'status' in data and data['status'] == 'success' and 'last_price' in data:
-                        ltp = float(data['last_price'])
-                        logger.info(f"  ✅ LTP (Format 5): ₹{ltp:.2f}")
-                        return ltp
-                    
-                    logger.warning(f"  ⚠️ LTP not found in any known format")
-                    logger.warning(f"  📋 Full Response: {json.dumps(data, indent=2)}")
-                    
-                except (KeyError, TypeError, ValueError, IndexError) as parse_error:
+                except Exception as parse_error:
                     logger.error(f"  ❌ LTP parsing error: {parse_error}")
-                    logger.error(f"  📋 Full Response: {json.dumps(data, indent=2)}")
             
             return 0.0
             
         except Exception as e:
             logger.error(f"  ❌ LTP error: {e}")
-            traceback.print_exc()
             return 0.0
     
     def get_option_chain(self, expiry: str) -> List[StrikeData]:
@@ -410,7 +504,6 @@ class UpstoxDataFetcher:
                 data = response.json()
                 
                 if 'data' not in data:
-                    logger.warning(f"  ⚠️ No 'data' in option chain response")
                     return []
                 
                 strikes = []
@@ -430,7 +523,7 @@ class UpstoxDataFetcher:
                             ce_price=float(call_data.get('ltp', 0)),
                             pe_price=float(put_data.get('ltp', 0))
                         ))
-                    except Exception as item_error:
+                    except:
                         continue
                 
                 logger.info(f"  ✅ Fetched {len(strikes)} strikes")
@@ -488,7 +581,6 @@ class OIAnalyzer:
     
     @staticmethod
     def calculate_oi_changes(current: List[StrikeData], previous: Optional[OISnapshot]) -> List[StrikeData]:
-        """Calculate OI changes compared to previous snapshot"""
         if not previous:
             return current
         
@@ -505,8 +597,6 @@ class OIAnalyzer:
     @staticmethod
     def create_oi_snapshot(strikes: List[StrikeData], spot_price: float, prev_snapshot: Optional[OISnapshot] = None) -> OISnapshot:
         atm_strikes = OIAnalyzer.get_atm_strikes(strikes, spot_price)
-        
-        # Calculate OI changes
         atm_strikes = OIAnalyzer.calculate_oi_changes(atm_strikes, prev_snapshot)
         
         pcr = OIAnalyzer.calculate_pcr(atm_strikes)
@@ -526,22 +616,44 @@ class OIAnalyzer:
             total_ce_oi=total_ce,
             total_pe_oi=total_pe
         )
+    
+    @staticmethod
+    def format_atm_option_chain(strikes: List[StrikeData], spot_price: float) -> str:
+        """Format ATM option chain data for telegram message"""
+        atm_strike = round(spot_price / 50) * 50
+        
+        # Get ATM ±3 strikes
+        strike_range = range(atm_strike - 150, atm_strike + 200, 50)
+        atm_strikes = [s for s in strikes if s.strike in strike_range]
+        atm_strikes = sorted(atm_strikes, key=lambda x: x.strike)
+        
+        def format_num(num):
+            if num >= 100000:
+                return f"{num/100000:.1f}L"
+            elif num >= 1000:
+                return f"{num/1000:.1f}K"
+            return str(int(num))
+        
+        lines = ["📊 ATM OPTION CHAIN (±3 strikes):"]
+        lines.append("Strike | CE_OI  | PE_OI  | CE_Pr | PE_Pr")
+        lines.append("─" * 45)
+        
+        for s in atm_strikes:
+            marker = " 🎯" if s.strike == atm_strike else ""
+            lines.append(
+                f"{s.strike}{marker} | {format_num(s.ce_oi)} | {format_num(s.pe_oi)} | "
+                f"₹{s.ce_price:.1f} | ₹{s.pe_price:.1f}"
+            )
+        
+        return "\n".join(lines)
 
 # ==================== ULTRA COMPRESSOR ====================
 class UltraCompressor:
-    """Ultra-compressed format for DeepSeek API (85% token reduction)"""
-    
     @staticmethod
     def compress_candles(df: pd.DataFrame) -> str:
-        """
-        Ultra-compressed candle format:
-        Time |Open |High |Low  |Close|Volume
-        09:15|23100|23150|23080|23120|850K
-        """
         df_copy = df.tail(CANDLE_COUNT).copy()
         df_copy['timestamp'] = df_copy['timestamp'].dt.strftime('%H:%M')
         
-        # Format volume with K/M suffix
         def format_volume(vol):
             if vol >= 1000000:
                 return f"{vol/1000000:.1f}M"
@@ -559,11 +671,6 @@ class UltraCompressor:
     
     @staticmethod
     def compress_oi(strikes: List[StrikeData]) -> str:
-        """
-        Ultra-compressed OI format:
-        Strike|C_OI  |C_ΔOI |C_Vol|P_OI  |P_ΔOI |P_Vol
-        23000 |150K  |+20K  |50K  |80K   |-10K  |30K
-        """
         def format_num(num):
             if abs(num) >= 1000000:
                 return f"{num/1000000:.1f}M"
@@ -605,28 +712,19 @@ class AIAnalyzer:
         return None
     
     @staticmethod
-    def analyze_with_deepseek(
-        df_5m: pd.DataFrame,
-        current_price: float,
-        current_oi: OISnapshot
-    ) -> Optional[TradeSignal]:
+    def analyze_with_deepseek(df_5m: pd.DataFrame, current_price: float, current_oi: OISnapshot) -> Optional[TradeSignal]:
         """Send ultra-compressed analysis request to DeepSeek"""
-        
         try:
-            # Ultra-compressed formats
             candles_compressed = UltraCompressor.compress_candles(df_5m)
             oi_compressed = UltraCompressor.compress_oi(current_oi.strikes)
             
-            # Calculate simple momentum indicators
             df_tail = df_5m.tail(50)
             sma_20 = df_tail['close'].tail(20).mean()
             price_momentum = ((current_price - sma_20) / sma_20) * 100
             
-            # Recent candle bias
             recent_closes = df_tail['close'].tail(10).values
             bullish_candles = sum(1 for i in range(1, len(recent_closes)) if recent_closes[i] > recent_closes[i-1])
             
-            # Ultra-compact prompt
             prompt = f"""NIFTY50 5-MIN ANALYSIS
 
 PRICE: ₹{current_price:.2f} | TIME: {datetime.now(IST).strftime('%H:%M')}
@@ -678,14 +776,8 @@ Bullish Candles (Last 10): {bullish_candles}/10
                 json={
                     "model": "deepseek-chat",
                     "messages": [
-                        {
-                            "role": "system",
-                            "content": "Elite F&O trader. Analyze 5-min price action + OI fusion. Respond ONLY in JSON."
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
+                        {"role": "system", "content": "Elite F&O trader. Analyze 5-min price action + OI fusion. Respond ONLY in JSON."},
+                        {"role": "user", "content": prompt}
                     ],
                     "temperature": 0.2,
                     "max_tokens": 2500
@@ -709,7 +801,6 @@ Bullish Candles (Last 10): {bullish_candles}/10
                 return None
             
             logger.info(f"  🧠 AI Signal: {analysis_dict.get('signal_type')} | Confidence: {analysis_dict.get('confidence')}%")
-            
             return TradeSignal(**analysis_dict)
             
         except Exception as e:
@@ -717,19 +808,11 @@ Bullish Candles (Last 10): {bullish_candles}/10
             traceback.print_exc()
             return None
 
-# ==================== CHART GENERATOR ====================
+# ==================== CHART GENERATOR - IMPROVED ====================
 class ChartGenerator:
-    """Creates professional trading charts with 5-min data"""
-    
     @staticmethod
-    def create_chart(
-        df_5m: pd.DataFrame,
-        signal: TradeSignal,
-        spot_price: float,
-        save_path: str
-    ):
-        """Generate professional chart with signal visualization - ALIGNED WITH LIVE MARKET"""
-        
+    def create_chart(df_5m: pd.DataFrame, signal: TradeSignal, spot_price: float, save_path: str):
+        """Generate professional chart - Volume visible, Info box at bottom"""
         BG = '#131722'
         GRID = '#1e222d'
         TEXT = '#d1d4dc'
@@ -738,17 +821,10 @@ class ChartGenerator:
         YELLOW = '#ffd700'
         BLUE = '#2962ff'
         
-        fig, (ax1, ax2) = plt.subplots(
-            2, 1,
-            figsize=(20, 11),
-            gridspec_kw={'height_ratios': [3, 1]},
-            facecolor=BG
-        )
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(20, 11), gridspec_kw={'height_ratios': [3, 1]}, facecolor=BG)
         
         ax1.set_facecolor(BG)
         
-        # Use last 200 candles (historical + today) up to current scan time
-        # This matches the analysis timeframe (420 candles for analysis, 200 for display)
         df_plot = df_5m.tail(200).copy()
         df_plot = df_plot.reset_index(drop=True)
         
@@ -756,7 +832,6 @@ class ChartGenerator:
         last_candle_time = df_plot.iloc[-1]['timestamp'].strftime('%d-%b %H:%M')
         logger.info(f"  📊 Chart: {len(df_plot)} candles ({first_candle_time} to {last_candle_time})")
         
-        # Extract time labels for x-axis (show every 10th candle)
         time_labels = []
         time_positions = []
         for idx in range(0, len(df_plot), 10):
@@ -766,168 +841,70 @@ class ChartGenerator:
         # Draw candlesticks
         for idx, row in df_plot.iterrows():
             color = GREEN if row['close'] > row['open'] else RED
-            
-            ax1.add_patch(Rectangle(
-                (idx, min(row['open'], row['close'])),
-                0.6,
-                abs(row['close'] - row['open']),
-                facecolor=color,
-                edgecolor=color,
-                alpha=0.8
-            ))
-            
-            ax1.plot(
-                [idx+0.3, idx+0.3],
-                [row['low'], row['high']],
-                color=color,
-                linewidth=1,
-                alpha=0.6
-            )
+            ax1.add_patch(Rectangle((idx, min(row['open'], row['close'])), 0.6, abs(row['close'] - row['open']), facecolor=color, edgecolor=color, alpha=0.8))
+            ax1.plot([idx+0.3, idx+0.3], [row['low'], row['high']], color=color, linewidth=1, alpha=0.6)
         
-        # Support levels
+        # Support/Resistance levels
         for support in signal.support_levels:
             ax1.axhline(support, color=GREEN, linestyle='--', linewidth=1.5, alpha=0.7)
-            ax1.text(
-                len(df_plot)*0.98, support,
-                f'S:₹{support:.1f}  ',
-                color=GREEN,
-                fontsize=10,
-                ha='right',
-                va='bottom',
-                bbox=dict(boxstyle='round', facecolor=BG, alpha=0.7)
-            )
+            ax1.text(len(df_plot)*0.98, support, f'S:₹{support:.1f}  ', color=GREEN, fontsize=10, ha='right', va='bottom', bbox=dict(boxstyle='round', facecolor=BG, alpha=0.7))
         
-        # Resistance levels
         for resistance in signal.resistance_levels:
             ax1.axhline(resistance, color=RED, linestyle='--', linewidth=1.5, alpha=0.7)
-            ax1.text(
-                len(df_plot)*0.98, resistance,
-                f'R:₹{resistance:.1f}  ',
-                color=RED,
-                fontsize=10,
-                ha='right',
-                va='top',
-                bbox=dict(boxstyle='round', facecolor=BG, alpha=0.7)
-            )
-        
-        # Entry point
-        ax1.scatter(
-            [len(df_plot)-1],
-            [signal.entry_price],
-            color=YELLOW,
-            s=300,
-            marker='D',
-            zorder=5,
-            edgecolors='white',
-            linewidths=2.5
-        )
+            ax1.text(len(df_plot)*0.98, resistance, f'R:₹{resistance:.1f}  ', color=RED, fontsize=10, ha='right', va='top', bbox=dict(boxstyle='round', facecolor=BG, alpha=0.7))
         
         # Stop loss and targets
-        ax1.axhline(signal.stop_loss, color=RED, linewidth=2.5, linestyle=':')
-        ax1.axhline(signal.target_1, color=GREEN, linewidth=2, linestyle=':')
-        ax1.axhline(signal.target_2, color=GREEN, linewidth=2, linestyle=':')
-        
-        # Entry label
-        ax1.text(
-            len(df_plot)*0.97, signal.entry_price,
-            f'ENTRY: ₹{signal.entry_price:.2f}  ',
-            color=YELLOW,
-            fontsize=11,
-            fontweight='bold',
-            ha='right',
-            va='center',
-            bbox=dict(boxstyle='round', facecolor=BG, edgecolor=YELLOW, linewidth=2)
-        )
+        ax1.axhline(signal.stop_loss, color=RED, linewidth=2.5, linestyle=':', label=f'SL: ₹{signal.stop_loss:.1f}')
+        ax1.axhline(signal.target_1, color=GREEN, linewidth=2, linestyle=':', label=f'T1: ₹{signal.target_1:.1f}')
+        ax1.axhline(signal.target_2, color=GREEN, linewidth=2, linestyle=':', label=f'T2: ₹{signal.target_2:.1f}')
         
         # Pattern detected
         if signal.pattern_detected and signal.pattern_detected != "None":
-            ax1.text(
-                len(df_plot)*0.5, df_plot['high'].max() * 0.995,
-                signal.pattern_detected.upper(),
-                color=YELLOW,
-                fontsize=12,
-                fontweight='bold',
-                ha='center',
-                bbox=dict(boxstyle='round', facecolor=BG, edgecolor=YELLOW, alpha=0.9)
-            )
+            ax1.text(len(df_plot)*0.5, df_plot['high'].max() * 0.995, signal.pattern_detected.upper(), color=YELLOW, fontsize=12, fontweight='bold', ha='center', bbox=dict(boxstyle='round', facecolor=BG, edgecolor=YELLOW, alpha=0.9))
         
         # Current market price
-        ax1.text(
-            len(df_plot)-1, spot_price,
-            f'  CMP: ₹{spot_price:.1f}',
-            fontsize=11,
-            color='white',
-            fontweight='bold',
-            bbox=dict(boxstyle='round', facecolor=BLUE, edgecolor='white', linewidth=2),
-            va='center'
-        )
+        ax1.text(len(df_plot)-1, spot_price, f'  CMP: ₹{spot_price:.1f}', fontsize=11, color='white', fontweight='bold', bbox=dict(boxstyle='round', facecolor=BLUE, edgecolor='white', linewidth=2), va='center')
         
-        # Signal info box
+        # Signal info box - MOVED TO BOTTOM LEFT
         signal_emoji = "🟢" if signal.signal_type == "CE_BUY" else "🔴" if signal.signal_type == "PE_BUY" else "⚪"
+        info_text = f"""{signal_emoji} {signal.signal_type} | Confidence: {signal.confidence}% | Score: {signal.alignment_score}/10
+Entry: ₹{signal.entry_price:.1f} | SL: ₹{signal.stop_loss:.1f} | T1: ₹{signal.target_1:.1f} | T2: ₹{signal.target_2:.1f} | RR: {signal.risk_reward}
+Strike: {signal.recommended_strike} | Pattern: {signal.pattern_detected}"""
         
-        info_text = f"""{signal_emoji} {signal.signal_type} | Confidence: {signal.confidence}%
-Score: {signal.alignment_score}/10
-
-Entry: ₹{signal.entry_price:.1f}
-SL: ₹{signal.stop_loss:.1f}
-T1: ₹{signal.target_1:.1f}
-T2: ₹{signal.target_2:.1f}
-RR: {signal.risk_reward}
-
-Strike: {signal.recommended_strike}
-Pattern: {signal.pattern_detected}
-
-Reason: {signal.reasoning[:100]}..."""
+        ax1.text(0.01, 0.01, info_text, transform=ax1.transAxes, fontsize=9, va='bottom', bbox=dict(boxstyle='round', facecolor=GRID, alpha=0.95, edgecolor=TEXT, linewidth=1), color=TEXT, family='monospace')
         
-        ax1.text(
-            0.01, 0.99,
-            info_text,
-            transform=ax1.transAxes,
-            fontsize=9,
-            va='top',
-            bbox=dict(boxstyle='round', facecolor=GRID, alpha=0.95, edgecolor=TEXT, linewidth=1),
-            color=TEXT,
-            family='monospace'
-        )
-        
-        # Add timestamp footer showing current time and last candle time
-        last_candle_time = df_plot.iloc[-1]['timestamp'].strftime('%H:%M')
+        # Timestamp footer
         current_time = datetime.now(IST).strftime('%H:%M:%S')
         footer_text = f"Last Candle: {last_candle_time} | Generated: {current_time}"
-        
-        ax1.text(
-            0.99, 0.01,
-            footer_text,
-            transform=ax1.transAxes,
-            fontsize=8,
-            ha='right',
-            va='bottom',
-            bbox=dict(boxstyle='round', facecolor=GRID, alpha=0.8),
-            color=TEXT,
-            family='monospace'
-        )
+        ax1.text(0.99, 0.01, footer_text, transform=ax1.transAxes, fontsize=8, ha='right', va='bottom', bbox=dict(boxstyle='round', facecolor=GRID, alpha=0.8), color=TEXT, family='monospace')
         
         title = f"NIFTY50 | 5-Minute Timeframe | {signal.signal_type} | Score: {signal.alignment_score}/10"
         ax1.set_title(title, color=TEXT, fontsize=14, fontweight='bold', pad=15)
-        
-        # Set x-axis labels with time
         ax1.set_xticks(time_positions)
         ax1.set_xticklabels(time_labels, rotation=45, ha='right')
-        
         ax1.grid(True, color=GRID, alpha=0.3)
         ax1.tick_params(colors=TEXT)
         ax1.set_ylabel('Price (₹)', color=TEXT, fontsize=11)
         ax1.set_xlabel('Time', color=TEXT, fontsize=11)
         
-        # Volume subplot
+        # Volume subplot - FIXED TO SHOW VOLUME
         ax2.set_facecolor(BG)
         colors = [GREEN if df_plot.iloc[i]['close'] > df_plot.iloc[i]['open'] else RED for i in range(len(df_plot))]
-        ax2.bar(range(len(df_plot)), df_plot['volume'], color=colors, alpha=0.6, width=0.8)
-        ax2.set_ylabel('Volume', color=TEXT, fontsize=11)
-        ax2.tick_params(colors=TEXT)
-        ax2.grid(True, color=GRID, alpha=0.3)
         
-        # Set x-axis labels for volume chart
+        # Ensure volume is visible
+        volumes = df_plot['volume'].values
+        ax2.bar(range(len(df_plot)), volumes, color=colors, alpha=0.7, width=0.8)
+        
+        # Format y-axis for volume
+        max_vol = volumes.max()
+        if max_vol >= 1000000:
+            ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1000000:.1f}M'))
+        elif max_vol >= 1000:
+            ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1000:.0f}K'))
+        
+        ax2.set_ylabel('Volume', color=TEXT, fontsize=11, fontweight='bold')
+        ax2.tick_params(colors=TEXT)
+        ax2.grid(True, color=GRID, alpha=0.3, axis='y')
         ax2.set_xticks(time_positions)
         ax2.set_xticklabels(time_labels, rotation=45, ha='right')
         ax2.set_xlabel('Time', color=TEXT, fontsize=11)
@@ -935,13 +912,10 @@ Reason: {signal.reasoning[:100]}..."""
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, facecolor=BG)
         plt.close()
-        
         logger.info(f"  📊 Chart saved: {save_path}")
 
 # ==================== MAIN BOT ====================
 class Nifty50Bot:
-    """Main bot orchestrator - 5-minute single timeframe"""
-    
     def __init__(self):
         self.data_fetcher = UpstoxDataFetcher(UPSTOX_ACCESS_TOKEN)
         self.telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -949,15 +923,27 @@ class Nifty50Bot:
         self.last_signal_time = None
     
     async def send_startup_message(self):
-        """Send bot startup notification"""
+        """Send bot startup notification with API status"""
         expiry = ExpiryCalculator.get_weekly_expiry(UPSTOX_ACCESS_TOKEN)
         expiry_display = ExpiryCalculator.format_for_display(expiry)
         days_left = ExpiryCalculator.days_to_expiry(expiry)
         
+        # Check API connections
+        logger.info("🔍 Checking API connections...")
+        upstox_status, upstox_msg = APIConnectionChecker.check_upstox(UPSTOX_ACCESS_TOKEN)
+        deepseek_status, deepseek_msg = APIConnectionChecker.check_deepseek(DEEPSEEK_API_KEY)
+        redis_status, redis_msg = APIConnectionChecker.check_redis(REDIS_URL)
+        
         message = f"""
-🚀 NIFTY50 5-MIN SINGLE TIMEFRAME BOT STARTED
+🚀 NIFTY50 5-MIN BOT STARTED
 
 ⏰ Time: {datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S')}
+
+🔌 API CONNECTION STATUS:
+━━━━━━━━━━━━━━━━━━━━━━━━
+• Upstox API: {upstox_msg}
+• DeepSeek AI: {deepseek_msg}
+• Redis Cache: {redis_msg}
 
 📊 Configuration:
 ✅ Symbol: NIFTY50 Index (NSE)
@@ -967,11 +953,10 @@ class Nifty50Bot:
 ✅ Market Hours: 9:15 AM - 3:30 PM
 ✅ Expiry: {expiry_display} ({expiry}) - {days_left} days left
 
-🔧 ULTRA COMPRESSION:
-✅ Enhanced LTP fetching (5 format support)
-✅ Ultra-compressed candle format (85% token reduction)
-✅ Ultra-compressed OI format (Strike|C_OI|C_ΔOI|C_Vol|P_OI|P_ΔOI|P_Vol)
-✅ Single timeframe analysis (~4K tokens total)
+🔧 DATA FETCHING:
+✅ Historical API (V2) - Past 3 days
+✅ Intraday API (V2) - Today's live data
+✅ Ultra-compressed format (85% token reduction)
 
 🧠 Analysis Framework:
 ✅ 5-MIN: 420 candles analysis
@@ -985,22 +970,17 @@ class Nifty50Bot:
 ✅ Alignment Score: 7+/10
 ✅ Cooldown: 30 minutes
 
-🔄 Status: Active & Running
+🔄 Status: {"🟢 Active & Running" if all([upstox_status, deepseek_status, redis_status]) else "⚠️ Running with Issues"}
 """
-        await self.telegram_bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=message
-        )
-        logger.info("✅ Startup message sent")
+        await self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        logger.info("✅ Startup message sent with API status")
     
-    async def send_telegram_alert(self, signal: TradeSignal, chart_path: str):
-        """Send trading signal to Telegram"""
+    async def send_telegram_alert(self, signal: TradeSignal, chart_path: str, oi_snapshot: OISnapshot, spot_price: float, all_strikes: List[StrikeData]):
+        """Send trading signal with option chain data"""
         try:
+            # Send chart first
             with open(chart_path, 'rb') as photo:
-                await self.telegram_bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=photo
-                )
+                await self.telegram_bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=photo)
             
             signal_emoji = "🟢" if signal.signal_type == "CE_BUY" else "🔴"
             
@@ -1008,6 +988,9 @@ class Nifty50Bot:
             price_analysis = signal.price_analysis[:250].replace('_', ' ').replace('*', ' ')
             oi_analysis = signal.oi_analysis[:250].replace('_', ' ').replace('*', ' ')
             pattern = signal.pattern_detected.replace('_', ' ').replace('*', ' ')
+            
+            # Format ATM option chain
+            atm_chain = OIAnalyzer.format_atm_option_chain(all_strikes, spot_price)
             
             message = f"""
 {signal_emoji} NIFTY50 {signal.signal_type} SIGNAL | 5-MIN TIMEFRAME
@@ -1041,14 +1024,12 @@ Risk:Reward → {signal.risk_reward}
 ⚠️ RISK FACTORS:
 {chr(10).join(['• ' + rf.replace('_', ' ').replace('*', ' ') for rf in signal.risk_factors[:3]])}
 
+{atm_chain}
+
 🕐 {datetime.now(IST).strftime('%d-%b %H:%M:%S')}
 """
             
-            await self.telegram_bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=message
-            )
-            
+            await self.telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
             logger.info(f"  ✅ Alert sent: {signal.signal_type}")
             
         except Exception as e:
@@ -1056,43 +1037,46 @@ Risk:Reward → {signal.risk_reward}
             traceback.print_exc()
     
     async def run_analysis(self):
-        """Run complete analysis cycle - 5-minute timeframe only"""
+        """Run complete analysis cycle"""
         try:
             self.scan_count += 1
             logger.info(f"\n{'='*70}")
             logger.info(f"🔍 SCAN #{self.scan_count} - {datetime.now(IST).strftime('%H:%M:%S')}")
             logger.info(f"{'='*70}")
             
-            # Step 1: Get cached 5-min data or fetch fresh
+            # Step 1: Get cached data or fetch fresh
             df_5m_cached = RedisOIManager.get_candle_data()
             
             if df_5m_cached is None or len(df_5m_cached) == 0:
-                logger.info("  📥 Fetching fresh 5-minute historical data...")
-                df_5m = self.data_fetcher.get_historical_data(days=7)
+                logger.info("  📥 Fetching fresh data (Historical + Intraday)...")
+                df_5m = self.data_fetcher.get_combined_data()
                 if df_5m.empty:
-                    logger.warning("  ⚠️ No historical data available")
+                    logger.warning("  ⚠️ No data available")
                     return
                 RedisOIManager.save_candle_data(df_5m)
             else:
-                logger.info(f"  ✅ Loaded {len(df_5m_cached)} 5-min candles from Redis")
+                logger.info(f"  ✅ Loaded {len(df_5m_cached)} candles from Redis")
                 df_5m = df_5m_cached
                 
-                # Fetch latest candle to update
-                logger.info("  📥 Fetching latest 5-min candle...")
-                df_latest = self.data_fetcher.get_historical_data(days=1)
+                # Update with latest intraday data
+                logger.info("  📥 Fetching latest intraday candle...")
+                df_latest = self.data_fetcher.get_intraday_data()
                 if not df_latest.empty:
                     df_5m = pd.concat([df_5m, df_latest]).drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+                    df_5m = df_5m.tail(500).reset_index(drop=True)
                     RedisOIManager.save_candle_data(df_5m)
-                    logger.info(f"  ✅ Updated with latest candles")
+                    logger.info(f"  ✅ Updated with latest data")
             
-            # Ensure we have at least 420 candles
-            if len(df_5m) < CANDLE_COUNT:
-                logger.warning(f"  ⚠️ Only {len(df_5m)} candles available, need {CANDLE_COUNT}")
-                if len(df_5m) < 100:
-                    logger.error("  ❌ Insufficient data for analysis")
-                    return
+            if len(df_5m) > 0:
+                first_time = df_5m.iloc[0]['timestamp'].strftime('%d-%b %H:%M')
+                last_time = df_5m.iloc[-1]['timestamp'].strftime('%d-%b %H:%M')
+                logger.info(f"  📊 Available data: {first_time} to {last_time} ({len(df_5m)} candles)")
             
-            logger.info(f"  📊 Total 5-min candles available: {len(df_5m)}")
+            if len(df_5m) < 100:
+                logger.error(f"  ❌ Insufficient data: only {len(df_5m)} candles")
+                return
+            
+            logger.info(f"  📊 Using {min(len(df_5m), CANDLE_COUNT)} candles for analysis")
             
             # Step 2: Get current price
             spot_price = self.data_fetcher.get_ltp()
@@ -1100,7 +1084,7 @@ Risk:Reward → {signal.risk_reward}
                 spot_price = df_5m['close'].iloc[-1]
                 logger.info(f"  💹 Using last close: ₹{spot_price:.2f}")
             
-            # Step 3: Get option chain data
+            # Step 3: Get option chain
             expiry = ExpiryCalculator.get_weekly_expiry(UPSTOX_ACCESS_TOKEN)
             expiry_display = ExpiryCalculator.format_for_display(expiry)
             logger.info(f"  📅 Expiry: {expiry_display} ({expiry})")
@@ -1110,24 +1094,19 @@ Risk:Reward → {signal.risk_reward}
                 logger.warning("  ⚠️ No option chain data available")
                 return
             
-            # Step 4: Create OI snapshot with changes
-            prev_oi = RedisOIManager.get_oi_snapshot(5)  # Get OI from 5 min ago for delta
+            # Step 4: Create OI snapshot
+            prev_oi = RedisOIManager.get_oi_snapshot(5)
             current_oi = OIAnalyzer.create_oi_snapshot(all_strikes, spot_price, prev_oi)
             logger.info(f"  📊 PCR: {current_oi.pcr:.2f} | Max Pain: {current_oi.max_pain}")
             
-            # Save current OI snapshot
             RedisOIManager.save_oi_snapshot(current_oi)
             
             if prev_oi:
                 logger.info(f"  ✅ OI changes calculated from 5 min ago (PCR: {prev_oi.pcr:.2f})")
             
-            # Step 5: Send to DeepSeek AI
+            # Step 5: AI Analysis
             logger.info("  🧠 Sending to DeepSeek AI (Ultra-Compressed Format)...")
-            signal = AIAnalyzer.analyze_with_deepseek(
-                df_5m=df_5m,
-                current_price=spot_price,
-                current_oi=current_oi
-            )
+            signal = AIAnalyzer.analyze_with_deepseek(df_5m=df_5m, current_price=spot_price, current_oi=current_oi)
             
             if not signal:
                 logger.info("  ⏸️ No valid signal generated")
@@ -1135,7 +1114,6 @@ Risk:Reward → {signal.risk_reward}
             
             logger.info(f"  🧠 AI Signal: {signal.signal_type} | Confidence: {signal.confidence}%")
             
-            # Step 6: Check signal validity
             if signal.signal_type == "NO_TRADE":
                 logger.info(f"  ⏸️ NO_TRADE signal (Confidence: {signal.confidence}%)")
                 return
@@ -1144,20 +1122,18 @@ Risk:Reward → {signal.risk_reward}
                 logger.info(f"  ⏸️ Below threshold (Conf: {signal.confidence}% | Score: {signal.alignment_score}/10)")
                 return
             
-            # Step 7: Check cooldown
             if self.last_signal_time:
                 time_since_last = (datetime.now(IST) - self.last_signal_time).total_seconds() / 60
                 if time_since_last < 30:
                     logger.info(f"  ⏸️ Cooldown active ({time_since_last:.0f} min since last alert)")
                     return
             
-            # Step 8: Generate alert
             logger.info(f"  🚨 ALERT! {signal.signal_type} | Conf: {signal.confidence}% | Score: {signal.alignment_score}/10")
             
             chart_path = f"/tmp/nifty50_5min_chart_{datetime.now(IST).strftime('%H%M')}.png"
             ChartGenerator.create_chart(df_5m, signal, spot_price, chart_path)
             
-            await self.send_telegram_alert(signal, chart_path)
+            await self.send_telegram_alert(signal, chart_path, current_oi, spot_price, all_strikes)
             self.last_signal_time = datetime.now(IST)
             
         except Exception as e:
@@ -1167,7 +1143,7 @@ Risk:Reward → {signal.risk_reward}
     async def run_scanner(self):
         """Main scanner loop"""
         logger.info("\n" + "="*80)
-        logger.info("🚀 NIFTY50 5-MIN SINGLE TIMEFRAME BOT - ULTRA COMPRESSED")
+        logger.info("🚀 NIFTY50 5-MIN BOT - HISTORICAL + INTRADAY")
         logger.info("="*80)
         
         await self.send_startup_message()
@@ -1177,22 +1153,18 @@ Risk:Reward → {signal.risk_reward}
                 now = datetime.now(IST)
                 current_time = now.time()
                 
-                # Check market hours
                 if current_time < MARKET_START_TIME or current_time > MARKET_END_TIME:
                     logger.info(f"⏸️ Market closed. Waiting... (Current: {current_time.strftime('%H:%M')})")
                     await asyncio.sleep(300)
                     continue
                 
-                # Check weekends
                 if now.weekday() >= 5:
                     logger.info(f"📅 Weekend. Pausing...")
                     await asyncio.sleep(3600)
                     continue
                 
-                # Run analysis
                 await self.run_analysis()
                 
-                # Calculate next scan time (every 5 minutes)
                 current_minute = now.minute
                 next_scan_minute = ((current_minute // 5) + 1) * 5
                 if next_scan_minute >= 60:
@@ -1203,7 +1175,6 @@ Risk:Reward → {signal.risk_reward}
                     next_scan += timedelta(hours=1)
                 
                 wait_seconds = (next_scan - now).total_seconds()
-                
                 logger.info(f"\n✅ Scan complete. Next scan at {next_scan.strftime('%H:%M')} ({wait_seconds:.0f}s)")
                 await asyncio.sleep(wait_seconds)
                 
@@ -1215,7 +1186,7 @@ Risk:Reward → {signal.risk_reward}
 # ==================== ENTRY POINT ====================
 if __name__ == "__main__":
     logger.info("="*80)
-    logger.info("STARTING NIFTY50 5-MIN SINGLE TIMEFRAME BOT")
+    logger.info("STARTING NIFTY50 5-MIN BOT - INTRADAY + HISTORICAL")
     logger.info("="*80)
     
     bot = Nifty50Bot()
