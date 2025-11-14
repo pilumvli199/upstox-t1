@@ -480,6 +480,13 @@ class UpstoxDataFetcher:
                 return df
             
             df_copy = df.copy()
+            
+            # Ensure timezone-aware timestamps (IST)
+            if df_copy['timestamp'].dt.tz is None:
+                df_copy['timestamp'] = df_copy['timestamp'].dt.tz_localize(IST)
+            else:
+                df_copy['timestamp'] = df_copy['timestamp'].dt.tz_convert(IST)
+            
             df_copy.set_index('timestamp', inplace=True)
             
             # Resample to 5-minute OHLCV
@@ -1164,10 +1171,18 @@ Risk:Reward → {signal.risk_reward}
                 logger.info(f"  ✅ Loaded {len(df_5m_cached)} candles from Redis")
                 df_5m = df_5m_cached
                 
+                # Ensure cached data is timezone-aware
+                if df_5m['timestamp'].dt.tz is None:
+                    df_5m['timestamp'] = df_5m['timestamp'].dt.tz_localize(IST)
+                
                 # Update with latest intraday data
                 logger.info("  📥 Fetching latest intraday candle...")
                 df_latest = self.data_fetcher.get_intraday_data()
                 if not df_latest.empty:
+                    # Ensure new data is also timezone-aware
+                    if df_latest['timestamp'].dt.tz is None:
+                        df_latest['timestamp'] = df_latest['timestamp'].dt.tz_localize(IST)
+                    
                     df_5m = pd.concat([df_5m, df_latest]).drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
                     df_5m = df_5m.tail(500).reset_index(drop=True)
                     RedisOIManager.save_candle_data(df_5m)
