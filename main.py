@@ -357,18 +357,16 @@ class UpstoxDataFetcher:
         }
     
     def get_intraday_data(self) -> pd.DataFrame:
-        """Fetch TODAY'S live 5-minute candles using Intraday API"""
+        """Fetch TODAY'S 1-minute data and resample to 5-minute"""
         try:
-            # CRITICAL: Intraday API URL format check
             encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
             
-            # Intraday API - Today's live data ONLY
-            url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_symbol}/5minute"
+            # CRITICAL FIX: Use 1minute (Upstox doesn't support 5minute)
+            url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_symbol}/1minute"
             
-            logger.info(f"  📥 Fetching TODAY's intraday data...")
+            logger.info(f"  📥 Fetching TODAY's 1-min intraday data...")
             logger.info(f"  🔗 URL: {url}")
             
-            # Check if market is open
             now = datetime.now(IST)
             if now.time() < MARKET_START_TIME:
                 logger.warning(f"  ⚠️ Market not started yet (opens at 9:15 AM)")
@@ -378,7 +376,7 @@ class UpstoxDataFetcher:
             
             if response.status_code == 200:
                 data = response.json()
-                logger.info(f"  📊 Intraday Response Status: {data.get('status', 'unknown')}")
+                logger.info(f"  📊 Intraday Status: {data.get('status', 'unknown')}")
                 
                 if 'data' in data and 'candles' in data['data']:
                     candles = data['data']['candles']
@@ -389,13 +387,15 @@ class UpstoxDataFetcher:
                         )
                         df['timestamp'] = pd.to_datetime(df['timestamp'])
                         df = df.sort_values('timestamp').reset_index(drop=True)
-                        logger.info(f"  ✅ Fetched {len(df)} intraday candles (TODAY)")
-                        return df
+                        
+                        # Resample 1-min to 5-min
+                        df_5m = self._resample_to_5min(df)
+                        logger.info(f"  ✅ Fetched {len(df)} 1-min → {len(df_5m)} 5-min candles (TODAY)")
+                        return df_5m
                     else:
-                        logger.warning(f"  ⚠️ Intraday API returned 0 candles (market may not be active)")
+                        logger.warning(f"  ⚠️ Intraday returned 0 candles (market may not be active)")
                 else:
-                    logger.warning(f"  ⚠️ Unexpected intraday response structure")
-                    logger.warning(f"  Response: {json.dumps(data, indent=2)[:500]}")
+                    logger.warning(f"  ⚠️ Unexpected response structure")
             else:
                 logger.warning(f"  ⚠️ Intraday API returned {response.status_code}")
                 try:
@@ -405,36 +405,37 @@ class UpstoxDataFetcher:
                     logger.warning(f"  Response: {response.text[:300]}")
             
             return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"  ❌ Intraday error: {e}")
+            traceback.print_exc()
+            return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"  ❌ Intraday data error: {e}")
             return pd.DataFrame()
     
     def get_historical_data(self, days: int = 5) -> pd.DataFrame:
-        """Fetch HISTORICAL 5-minute data (COMPLETED days only, NOT today)"""
+        """Fetch HISTORICAL 1-minute data and resample to 5-minute"""
         try:
-            # CRITICAL FIX: to_date must be YESTERDAY (completed day)
-            # Upstox historical API does NOT include current day
-            to_date = (datetime.now(IST) - timedelta(days=1)).date()  # Yesterday
-            from_date = (datetime.now(IST) - timedelta(days=days)).date()  # 5 days ago
+            to_date = (datetime.now(IST) - timedelta(days=1)).date()
+            from_date = (datetime.now(IST) - timedelta(days=days)).date()
             
-            # Double check: Don't fetch if weekend
-            if to_date.weekday() >= 5:  # Saturday/Sunday
-                # Move to last Friday
+            if to_date.weekday() >= 5:
                 days_back = to_date.weekday() - 4
                 to_date = to_date - timedelta(days=days_back)
             
             encoded_symbol = urllib.parse.quote(NIFTY_SYMBOL, safe='')
             
-            url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/5minute/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
+            # CRITICAL FIX: Use 1minute (Upstox doesn't support 5minute)
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded_symbol}/1minute/{to_date.strftime('%Y-%m-%d')}/{from_date.strftime('%Y-%m-%d')}"
             
-            logger.info(f"  📥 Fetching historical ({from_date} to {to_date} - COMPLETED days only)...")
+            logger.info(f"  📥 Fetching 1-min historical ({from_date} to {to_date})...")
             logger.info(f"  🔗 URL: {url}")
             response = requests.get(url, headers=self.headers, timeout=30)
             
             if response.status_code == 200:
                 data = response.json()
-                logger.info(f"  📊 Historical Response Status: {data.get('status', 'unknown')}")
+                logger.info(f"  📊 Historical Status: {data.get('status', 'unknown')}")
                 
                 if 'data' in data and 'candles' in data['data']:
                     candles = data['data']['candles']
@@ -445,13 +446,15 @@ class UpstoxDataFetcher:
                         )
                         df['timestamp'] = pd.to_datetime(df['timestamp'])
                         df = df.sort_values('timestamp').reset_index(drop=True)
-                        logger.info(f"  ✅ Fetched {len(df)} historical candles")
-                        return df
+                        
+                        # Resample 1-min to 5-min
+                        df_5m = self._resample_to_5min(df)
+                        logger.info(f"  ✅ Fetched {len(df)} 1-min → {len(df_5m)} 5-min candles")
+                        return df_5m
                     else:
-                        logger.warning(f"  ⚠️ Historical API returned 0 candles")
+                        logger.warning(f"  ⚠️ Historical returned 0 candles")
                 else:
-                    logger.warning(f"  ⚠️ Unexpected historical response structure")
-                    logger.warning(f"  Response: {json.dumps(data, indent=2)[:500]}")
+                    logger.warning(f"  ⚠️ Unexpected response structure")
             else:
                 logger.warning(f"  ⚠️ Historical API returned {response.status_code}")
                 try:
@@ -461,9 +464,37 @@ class UpstoxDataFetcher:
                     logger.warning(f"  Response: {response.text[:300]}")
             
             return pd.DataFrame()
+        except Exception as e:
+            logger.error(f"  ❌ Historical error: {e}")
+            traceback.print_exc()
+            return pd.DataFrame()
             
         except Exception as e:
             logger.error(f"  ❌ Historical data error: {e}")
+            return pd.DataFrame()
+    
+    def _resample_to_5min(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Resample 1-minute candles to 5-minute candles"""
+        try:
+            if df.empty:
+                return df
+            
+            df_copy = df.copy()
+            df_copy.set_index('timestamp', inplace=True)
+            
+            # Resample to 5-minute OHLCV
+            df_5m = df_copy.resample('5T').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+                'oi': 'last'
+            }).dropna().reset_index()
+            
+            return df_5m
+        except Exception as e:
+            logger.error(f"  ❌ Resample error: {e}")
             return pd.DataFrame()
     
     def get_combined_data(self) -> pd.DataFrame:
