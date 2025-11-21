@@ -95,13 +95,15 @@ class RedisBrain:
     def save_snapshot(self, ce_oi, pe_oi):
         """Saves OI snapshot with 1-min timestamp"""
         now = datetime.now(IST)
+        # Round to nearest minute for consistent keys
         slot = now.replace(second=0, microsecond=0)
-        key = f"oi:{slot.strftime('%H%M')}"
-        data = json.dumps({"ce": ce_oi, "pe": pe_oi})
+        key = f"oi:{slot.strftime('%Y%m%d_%H%M')}"  # Better format: oi:20251121_0531
+        data = json.dumps({"ce": ce_oi, "pe": pe_oi, "ts": slot.isoformat()})
         
         if self.client:
             try:
                 self.client.setex(key, 7200, data)  # Keep for 2 hours
+                logger.debug(f"💾 Saved OI: {key}")
             except Exception as e:
                 logger.error(f"Redis save error: {e}")
                 self.memory[key] = data
@@ -110,20 +112,29 @@ class RedisBrain:
 
     def get_oi_delta(self, current_ce, current_pe, minutes_ago=15):
         """Calculate % OI Change over X minutes"""
-        now = datetime.now(IST) - timedelta(minutes=minutes_ago)
-        slot = now.replace(second=0, microsecond=0)
-        key = f"oi:{slot.strftime('%H%M')}"
+        now = datetime.now(IST)
+        # Round current time to minute
+        current_slot = now.replace(second=0, microsecond=0)
+        
+        # Calculate past slot
+        past_time = current_slot - timedelta(minutes=minutes_ago)
+        key = f"oi:{past_time.strftime('%Y%m%d_%H%M')}"
         
         past_data = None
         if self.client:
             try:
                 past_data = self.client.get(key)
+                if past_data:
+                    logger.debug(f"📖 Found OI: {key}")
+                else:
+                    logger.warning(f"❌ OI not found: {key}")
             except:
                 past_data = self.memory.get(key)
         else:
             past_data = self.memory.get(key)
             
         if not past_data:
+            logger.warning(f"⚠️ No historical OI data for {minutes_ago}m ago")
             return 0.0, 0.0
             
         try:
