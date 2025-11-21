@@ -93,22 +93,30 @@ class RedisBrain:
             logger.info("📦 Running in RAM-only mode")
 
     def save_snapshot(self, ce_oi, pe_oi):
-        """Saves OI snapshot with 1-min timestamp"""
+        """Saves OI snapshot with 1-min timestamp in IST"""
         now = datetime.now(IST)
         # Round to nearest minute for consistent keys
         slot = now.replace(second=0, microsecond=0)
-        key = f"oi:{slot.strftime('%Y%m%d_%H%M')}"  # Better format: oi:20251121_0531
-        data = json.dumps({"ce": ce_oi, "pe": pe_oi, "ts": slot.isoformat()})
+        
+        # CRITICAL: Use IST hour/minute, not UTC!
+        key = f"oi:{slot.strftime('%Y%m%d_%H%M')}"
+        data = json.dumps({
+            "ce": ce_oi, 
+            "pe": pe_oi, 
+            "ts": slot.isoformat(),
+            "ist_time": slot.strftime('%H:%M')  # For debugging
+        })
         
         if self.client:
             try:
                 self.client.setex(key, 7200, data)  # Keep for 2 hours
-                logger.debug(f"💾 Saved OI: {key}")
+                logger.info(f"💾 Saved: {key} at IST {slot.strftime('%H:%M')}")
             except Exception as e:
                 logger.error(f"Redis save error: {e}")
                 self.memory[key] = data
         else:
             self.memory[key] = data
+            logger.info(f"💾 RAM Saved: {key}")
 
     def get_oi_delta(self, current_ce, current_pe, minutes_ago=15):
         """Calculate % OI Change over X minutes"""
@@ -116,31 +124,43 @@ class RedisBrain:
         # Round current time to minute
         current_slot = now.replace(second=0, microsecond=0)
         
-        # Calculate past slot
+        # Calculate past slot IN IST
         past_time = current_slot - timedelta(minutes=minutes_ago)
         key = f"oi:{past_time.strftime('%Y%m%d_%H%M')}"
+        
+        logger.info(f"🔍 Looking for: {key} (IST {past_time.strftime('%H:%M')})")
         
         past_data = None
         if self.client:
             try:
                 past_data = self.client.get(key)
                 if past_data:
-                    logger.debug(f"📖 Found OI: {key}")
+                    logger.info(f"✅ Found: {key}")
                 else:
-                    logger.warning(f"❌ OI not found: {key}")
-            except:
+                    # Try to list all available keys for debugging
+                    try:
+                        all_keys = self.client.keys("oi:*")
+                        logger.warning(f"❌ Not found: {key}")
+                        logger.warning(f"📋 Available keys: {all_keys[:5]}")  # Show first 5
+                    except:
+                        logger.warning(f"❌ Not found: {key}")
+            except Exception as e:
+                logger.error(f"Redis read error: {e}")
                 past_data = self.memory.get(key)
         else:
             past_data = self.memory.get(key)
+            if not past_data:
+                logger.warning(f"RAM: Keys available: {list(self.memory.keys())[:5]}")
             
         if not past_data:
-            logger.warning(f"⚠️ No historical OI data for {minutes_ago}m ago")
+            logger.warning(f"⚠️ No historical OI for {minutes_ago}m ago ({past_time.strftime('%H:%M')} IST)")
             return 0.0, 0.0
             
         try:
             past = json.loads(past_data)
             ce_chg = ((current_ce - past['ce']) / past['ce']) * 100 if past['ce'] > 0 else 0
             pe_chg = ((current_pe - past['pe']) / past['pe']) * 100 if past['pe'] > 0 else 0
+            logger.info(f"📊 Delta calculated: CE {ce_chg:+.1f}% | PE {pe_chg:+.1f}%")
             return ce_chg, pe_chg
         except Exception as e:
             logger.error(f"OI Delta calculation error: {e}")
