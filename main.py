@@ -65,7 +65,10 @@ TEST_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
 def get_futures_symbol(index_name: str) -> str:
     """
     Generate current month futures symbol
-    Fixed format: NSE_FO|NIFTY24DECFUT
+    FIXED: Proper contract year calculation
+    
+    Contract year = Year when contract started (April to March cycle)
+    Example: Nov 2025 expiry = NIFTY24NOV (contract from April 2024)
     """
     now = datetime.now(IST)
     year = now.year
@@ -77,7 +80,7 @@ def get_futures_symbol(index_name: str) -> str:
     days_to_tuesday = (last_date.weekday() - 1) % 7
     last_tuesday = last_date - timedelta(days=days_to_tuesday)
     
-    # If expiry passed, next month
+    # If expiry passed, move to next month
     if now.date() > last_tuesday.date() or (
         now.date() == last_tuesday.date() and now.time() > time(15, 30)
     ):
@@ -86,8 +89,15 @@ def get_futures_symbol(index_name: str) -> str:
             year += 1
             month = 1
     
-    # Format: NIFTY24DEC
-    year_short = year % 100
+    # Contract year calculation (April to March cycle)
+    # If month is Jan-Mar, contract year is previous year
+    # If month is Apr-Dec, contract year is current year
+    contract_year = year
+    if month <= 3:  # Jan, Feb, Mar
+        contract_year = year - 1
+    
+    # Format: NIFTY24NOV
+    year_short = contract_year % 100
     month_name = datetime(year, month, 1).strftime('%b').upper()
     
     prefix = INDICES[index_name]['futures_prefix']
