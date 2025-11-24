@@ -1,574 +1,228 @@
 #!/usr/bin/env python3
 """
-MULTI-INDEX DATA FETCHING TEST - V1.1 FIXED
-============================================
-✅ Fixed token handling
-✅ Better error messages
-✅ Upstox API verified endpoints
-✅ Proper response parsing
+UPSTOX INSTRUMENT SEARCH
+========================
+Find correct futures symbols for NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY
 
-Author: Fixed Version
+This will search Upstox's instrument database and show:
+- Available futures contracts
+- Correct symbol format
+- Expiry dates
+
+Author: Instrument Search Tool
 Date: November 24, 2025
 """
 
 import asyncio
 import aiohttp
 import json
-import sys
-from datetime import datetime, timedelta, time
-from calendar import monthrange
+import os
+from datetime import datetime
 import pytz
-from typing import Dict, Tuple, Optional
 
 # ==================== CONFIGURATION ====================
 IST = pytz.timezone('Asia/Kolkata')
-
-# ⚠️ ENVIRONMENT VARIABLE से लेगा
-import os
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', '')
 
-# ✅ VERIFIED INSTRUMENT KEYS - Upstox API Format
-INDICES = {
-    'NIFTY': {
-        'spot': "NSE_INDEX|Nifty 50",
-        'name': 'NIFTY 50',
-        'strike_gap': 50,
-        'has_weekly': True,
-        'futures_prefix': 'NIFTY'
-    },
-    'BANKNIFTY': {
-        'spot': "NSE_INDEX|Nifty Bank",
-        'name': 'BANK NIFTY',
-        'strike_gap': 100,
-        'has_weekly': False,
-        'futures_prefix': 'BANKNIFTY'
-    },
-    'FINNIFTY': {
-        'spot': "NSE_INDEX|Nifty Fin Service",
-        'name': 'FIN NIFTY',
-        'strike_gap': 50,
-        'has_weekly': False,
-        'futures_prefix': 'FINNIFTY'
-    },
-    'MIDCPNIFTY': {
-        'spot': "NSE_INDEX|NIFTY MID SELECT",
-        'name': 'MIDCAP NIFTY',
-        'strike_gap': 25,
-        'has_weekly': False,
-        'futures_prefix': 'MIDCPNIFTY'
-    }
-}
+# Indices to search
+SEARCH_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
 
-TEST_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
-
-# ==================== HELPER FUNCTIONS ====================
-def get_futures_symbol(index_name: str) -> str:
-    """
-    Generate current month futures symbol
-    FIXED: Proper contract year calculation
+# ==================== INSTRUMENT SEARCHER ====================
+class InstrumentSearcher:
+    """Search Upstox instrument database"""
     
-    Contract year = Year when contract started (April to March cycle)
-    Example: Nov 2025 expiry = NIFTY24NOV (contract from April 2024)
-    """
-    now = datetime.now(IST)
-    year = now.year
-    month = now.month
-    
-    # Check if current month expiry passed
-    last_day = monthrange(year, month)[1]
-    last_date = datetime(year, month, last_day, tzinfo=IST)
-    days_to_tuesday = (last_date.weekday() - 1) % 7
-    last_tuesday = last_date - timedelta(days=days_to_tuesday)
-    
-    # If expiry passed, move to next month
-    if now.date() > last_tuesday.date() or (
-        now.date() == last_tuesday.date() and now.time() > time(15, 30)
-    ):
-        month += 1
-        if month > 12:
-            year += 1
-            month = 1
-    
-    # Contract year calculation (April to March cycle)
-    # If month is Jan-Mar, contract year is previous year
-    # If month is Apr-Dec, contract year is current year
-    contract_year = year
-    if month <= 3:  # Jan, Feb, Mar
-        contract_year = year - 1
-    
-    # Format: NIFTY24NOV
-    year_short = contract_year % 100
-    month_name = datetime(year, month, 1).strftime('%b').upper()
-    
-    prefix = INDICES[index_name]['futures_prefix']
-    symbol = f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
-    
-    return symbol
-
-def get_expiry_date(index_name: str) -> str:
-    """Get expiry in YYYY-MM-DD format"""
-    now = datetime.now(IST)
-    today = now.date()
-    config = INDICES[index_name]
-    
-    if config['has_weekly']:
-        # NIFTY: Next Tuesday
-        days_to_tuesday = (1 - today.weekday() + 7) % 7
-        
-        if days_to_tuesday == 0:
-            expiry = today if now.time() <= time(15, 30) else today + timedelta(days=7)
-        else:
-            expiry = today + timedelta(days=days_to_tuesday)
-    
-    else:
-        # Monthly: Last Tuesday
-        year, month = now.year, now.month
-        
-        last_day = monthrange(year, month)[1]
-        last_date = datetime(year, month, last_day)
-        
-        days_to_tuesday = (last_date.weekday() - 1) % 7
-        last_tuesday = last_date - timedelta(days=days_to_tuesday)
-        
-        if now.date() > last_tuesday.date() or (
-            now.date() == last_tuesday.date() and now.time() > time(15, 30)
-        ):
-            month += 1
-            if month > 12:
-                year += 1
-                month = 1
-            
-            last_day = monthrange(year, month)[1]
-            last_date = datetime(year, month, last_day)
-            days_to_tuesday = (last_date.weekday() - 1) % 7
-            last_tuesday = last_date - timedelta(days=days_to_tuesday)
-        
-        expiry = last_tuesday.date()
-    
-    return expiry.strftime('%Y-%m-%d')
-
-# ==================== DATA FETCHER ====================
-class DataFetcher:
-    """Test data fetching for one index"""
-    
-    def __init__(self, index_name: str):
-        self.index_name = index_name
-        self.config = INDICES[index_name]
-        self.spot_symbol = self.config['spot']
-        self.strike_gap = self.config['strike_gap']
-        
+    def __init__(self):
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        
-        self.results = {
-            'spot': {'status': 'pending', 'data': None, 'error': None},
-            'futures': {'status': 'pending', 'data': None, 'error': None},
-            'options': {'status': 'pending', 'data': None, 'error': None}
-        }
+        self.base_url = "https://api.upstox.com/v2"
     
-    async def fetch_url(self, url: str, session: aiohttp.ClientSession) -> Optional[dict]:
-        """Fetch with proper error handling"""
+    async def download_instruments(self, session: aiohttp.ClientSession):
+        """
+        Download instrument master file from Upstox
+        This contains ALL available instruments
+        """
+        print("\n📥 Downloading Upstox Instrument Database...")
+        print("   (This may take 10-15 seconds)")
+        
+        # Upstox provides instrument CSV
+        url = f"{self.base_url}/instruments"
+        
         try:
-            async with session.get(url, headers=self.headers, 
-                                 timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                
-                response_text = await resp.text()
+            async with session.get(url, headers=self.headers,
+                                 timeout=aiohttp.ClientTimeout(total=30)) as resp:
                 
                 if resp.status == 200:
-                    try:
-                        return json.loads(response_text)
-                    except json.JSONDecodeError:
-                        return {'error': 'Invalid JSON response', 'details': response_text[:200]}
-                
-                elif resp.status == 401:
-                    return {'error': 'UNAUTHORIZED - Token invalid/expired', 'status': 401}
-                
-                elif resp.status == 429:
-                    return {'error': 'RATE LIMIT - Too many requests', 'status': 429}
-                
+                    content = await resp.text()
+                    print(f"   ✅ Downloaded ({len(content)} bytes)")
+                    return content
                 else:
-                    return {'error': f'HTTP {resp.status}', 'details': response_text[:200]}
-        
-        except asyncio.TimeoutError:
-            return {'error': 'TIMEOUT - Request took too long'}
+                    error = await resp.text()
+                    print(f"   ❌ Failed: HTTP {resp.status}")
+                    print(f"   Error: {error[:200]}")
+                    return None
         
         except Exception as e:
-            return {'error': f'NETWORK ERROR: {str(e)}'}
+            print(f"   ❌ Error: {e}")
+            return None
     
-    async def test_spot_price(self, session: aiohttp.ClientSession):
-        """Test 1: Fetch spot price"""
-        print(f"\n📊 [{self.config['name']}] Testing Spot Price...")
+    def parse_instruments(self, csv_content: str, index_prefix: str):
+        """
+        Parse CSV and find futures for specific index
+        """
+        if not csv_content:
+            return []
         
-        # URL encode properly
-        spot_encoded = self.spot_symbol.replace('|', '%7C').replace(' ', '%20')
-        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={spot_encoded}"
+        lines = csv_content.strip().split('\n')
         
-        print(f"   URL: {url[:80]}...")
+        if len(lines) < 2:
+            return []
         
-        result = await self.fetch_url(url, session)
+        # First line is header
+        header = lines[0].split(',')
         
-        if result and 'error' in result:
-            self.results['spot']['status'] = 'failed'
-            self.results['spot']['error'] = result['error']
-            print(f"   ❌ FAILED: {result['error']}")
-            if result.get('status') == 401:
-                print(f"   ⚠️ TOKEN ISSUE: Generate new Upstox token!")
-            return
-        
-        if result and 'data' in result:
-            # Try multiple key formats
-            spot_price = 0
-            found_key = None
-            
-            possible_keys = [
-                self.spot_symbol,
-                self.spot_symbol.replace('NSE_INDEX|', 'NSE_INDEX:'),
-                self.config['name']
-            ]
-            
-            for key in possible_keys:
-                if key in result['data']:
-                    ltp_data = result['data'][key]
-                    spot_price = ltp_data.get('last_price', 0)
-                    found_key = key
-                    if spot_price > 0:
-                        break
-            
-            if spot_price > 0:
-                self.results['spot']['status'] = 'success'
-                self.results['spot']['data'] = {
-                    'price': spot_price,
-                    'key_used': found_key
-                }
-                print(f"   ✅ SUCCESS: ₹{spot_price}")
-            else:
-                self.results['spot']['status'] = 'failed'
-                self.results['spot']['error'] = 'Price not found in response'
-                print(f"   ❌ FAILED: Price not found")
-                print(f"   Available keys: {list(result.get('data', {}).keys())}")
-        else:
-            self.results['spot']['status'] = 'failed'
-            self.results['spot']['error'] = 'No data in response'
-            print(f"   ❌ FAILED: No data in response")
-    
-    async def test_futures_candles(self, session: aiohttp.ClientSession):
-        """Test 2: Fetch futures candles"""
-        print(f"\n📈 [{self.config['name']}] Testing Futures Candles...")
-        
-        futures_symbol = get_futures_symbol(self.index_name)
-        print(f"   Symbol: {futures_symbol}")
-        
-        futures_encoded = futures_symbol.replace('|', '%7C')
-        to_date = datetime.now(IST).strftime('%Y-%m-%d')
-        from_date = (datetime.now(IST) - timedelta(days=5)).strftime('%Y-%m-%d')
-        
-        url = f"https://api.upstox.com/v2/historical-candle/{futures_encoded}/1minute/{to_date}/{from_date}"
-        
-        print(f"   URL: {url[:80]}...")
-        
-        result = await self.fetch_url(url, session)
-        
-        if result and 'error' in result:
-            self.results['futures']['status'] = 'failed'
-            self.results['futures']['error'] = result['error']
-            print(f"   ❌ FAILED: {result['error']}")
-            return
-        
-        if result and result.get('status') == 'success':
-            candles = result.get('data', {}).get('candles', [])
-            
-            if candles:
-                # Parse candles (no pandas dependency)
-                today = datetime.now(IST).date()
-                today_candles = []
-                
-                for candle in candles:
-                    try:
-                        # candle = [timestamp, open, high, low, close, volume, oi]
-                        ts = datetime.fromisoformat(candle[0].replace('Z', '+00:00'))
-                        ts_ist = ts.astimezone(IST)
-                        
-                        if ts_ist.date() == today:
-                            today_candles.append({
-                                'time': ts_ist.strftime('%H:%M:%S'),
-                                'open': candle[1],
-                                'high': candle[2],
-                                'low': candle[3],
-                                'close': candle[4],
-                                'volume': candle[5],
-                                'oi': candle[6]
-                            })
-                    except:
-                        continue
-                
-                if today_candles:
-                    latest = today_candles[-1]
-                    self.results['futures']['status'] = 'success'
-                    self.results['futures']['data'] = {
-                        'total_candles': len(today_candles),
-                        'latest_price': latest['close'],
-                        'latest_time': latest['time'],
-                        'sample': latest
-                    }
-                    print(f"   ✅ SUCCESS: {len(today_candles)} candles")
-                    print(f"   Latest: ₹{latest['close']} @ {latest['time']}")
-                else:
-                    self.results['futures']['status'] = 'warning'
-                    self.results['futures']['error'] = 'No candles for today (market closed?)'
-                    print(f"   ⚠️ WARNING: No today candles (Total: {len(candles)})")
-            else:
-                self.results['futures']['status'] = 'failed'
-                self.results['futures']['error'] = 'Empty candles array'
-                print(f"   ❌ FAILED: No candles returned")
-        else:
-            self.results['futures']['status'] = 'failed'
-            self.results['futures']['error'] = 'Invalid response format'
-            print(f"   ❌ FAILED: Invalid response")
-    
-    async def test_option_chain(self, session: aiohttp.ClientSession):
-        """Test 3: Fetch option chain"""
-        print(f"\n⚔️ [{self.config['name']}] Testing Option Chain...")
-        
-        if self.results['spot']['status'] != 'success':
-            print(f"   ⚠️ SKIPPED: Need spot price first")
-            return
-        
-        spot_price = self.results['spot']['data']['price']
-        expiry = get_expiry_date(self.index_name)
-        
-        print(f"   Spot: ₹{spot_price}")
-        print(f"   Expiry: {expiry}")
-        
-        spot_encoded = self.spot_symbol.replace('|', '%7C').replace(' ', '%20')
-        url = f"https://api.upstox.com/v2/option/chain?instrument_key={spot_encoded}&expiry_date={expiry}"
-        
-        print(f"   URL: {url[:80]}...")
-        
-        result = await self.fetch_url(url, session)
-        
-        if result and 'error' in result:
-            self.results['options']['status'] = 'failed'
-            self.results['options']['error'] = result['error']
-            print(f"   ❌ FAILED: {result['error']}")
-            return
-        
-        if result and result.get('status') == 'success':
-            all_options = result.get('data', [])
-            
-            # Filter 5 strikes
-            atm_strike = round(spot_price / self.strike_gap) * self.strike_gap
-            min_strike = atm_strike - (2 * self.strike_gap)
-            max_strike = atm_strike + (2 * self.strike_gap)
-            
-            print(f"   ATM: {atm_strike} | Range: {min_strike}-{max_strike}")
-            
-            strike_data = {}
-            total_ce_oi = 0
-            total_pe_oi = 0
-            
-            for option in all_options:
-                strike = option.get('strike_price', 0)
-                
-                if min_strike <= strike <= max_strike:
-                    call_data = option.get('call_options', {}).get('market_data', {})
-                    put_data = option.get('put_options', {}).get('market_data', {})
-                    
-                    ce_oi = call_data.get('oi', 0)
-                    pe_oi = put_data.get('oi', 0)
-                    
-                    strike_data[strike] = {
-                        'ce_oi': ce_oi,
-                        'pe_oi': pe_oi,
-                        'ce_ltp': call_data.get('ltp', 0),
-                        'pe_ltp': put_data.get('ltp', 0)
-                    }
-                    
-                    total_ce_oi += ce_oi
-                    total_pe_oi += pe_oi
-            
-            if strike_data:
-                pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 0
-                
-                self.results['options']['status'] = 'success'
-                self.results['options']['data'] = {
-                    'strikes_found': len(strike_data),
-                    'atm_strike': atm_strike,
-                    'total_ce_oi': total_ce_oi,
-                    'total_pe_oi': total_pe_oi,
-                    'pcr': pcr,
-                    'strikes': strike_data
-                }
-                
-                print(f"   ✅ SUCCESS: {len(strike_data)} strikes")
-                print(f"   PCR: {pcr:.2f} | CE OI: {total_ce_oi:,} | PE OI: {total_pe_oi:,}")
-                
-                # Strike details
-                print(f"\n   Strike Details:")
-                for strike in sorted(strike_data.keys()):
-                    data = strike_data[strike]
-                    marker = "📍 ATM" if strike == atm_strike else ""
-                    print(f"   {strike}: CE={data['ce_oi']:,} PE={data['pe_oi']:,} {marker}")
-            else:
-                self.results['options']['status'] = 'failed'
-                self.results['options']['error'] = f'No strikes in range {min_strike}-{max_strike}'
-                print(f"   ❌ FAILED: No strikes found")
-        else:
-            self.results['options']['status'] = 'failed'
-            self.results['options']['error'] = 'Invalid response'
-            print(f"   ❌ FAILED: Invalid response")
-    
-    async def run_all_tests(self):
-        """Run all tests"""
-        async with aiohttp.ClientSession() as session:
-            await self.test_spot_price(session)
-            await asyncio.sleep(1)
-            
-            await self.test_futures_candles(session)
-            await asyncio.sleep(1)
-            
-            await self.test_option_chain(session)
-    
-    def print_summary(self):
-        """Print summary"""
-        print(f"\n{'='*60}")
-        print(f"📋 SUMMARY: {self.config['name']}")
-        print(f"{'='*60}")
-        
-        for test_name, result in self.results.items():
-            status_map = {
-                'success': '✅',
-                'failed': '❌',
-                'warning': '⚠️',
-                'pending': '⏳'
-            }
-            emoji = status_map.get(result['status'], '❓')
-            print(f"{emoji} {test_name.upper()}: {result['status']}")
-            if result['error']:
-                print(f"   Error: {result['error']}")
-        
-        print(f"{'='*60}\n")
-
-# ==================== MAIN TEST ====================
-async def test_all_indices():
-    """Test all indices"""
-    
-    print("="*70)
-    print("🧪 MULTI-INDEX DATA FETCHING TEST V1.1")
-    print("="*70)
-    print(f"⏰ Started: {datetime.now(IST).strftime('%d-%b %I:%M:%S %p')}")
-    print(f"🎯 Testing: {len(TEST_INDICES)} indices")
-    print("="*70)
-    
-    # Check token
-    if not UPSTOX_ACCESS_TOKEN or UPSTOX_ACCESS_TOKEN == '':
-        print("\n❌ ERROR: UPSTOX_ACCESS_TOKEN not set!")
-        print("\n💡 Fix:")
-        print("   1. Railway Dashboard → Variables")
-        print("   2. Add: UPSTOX_ACCESS_TOKEN = your_token")
-        print("   3. Redeploy")
-        print("\n⚠️ Token must be fresh (generated today)")
-        return
-    
-    print(f"\n✅ Token found: {UPSTOX_ACCESS_TOKEN[:20]}...")
-    print("")
-    
-    all_results = {}
-    
-    for index_name in TEST_INDICES:
-        print(f"\n{'#'*70}")
-        print(f"🔍 TESTING: {INDICES[index_name]['name']}")
-        print(f"{'#'*70}")
-        
-        fetcher = DataFetcher(index_name)
-        
+        # Find column indices
         try:
-            await fetcher.run_all_tests()
-        except Exception as e:
-            print(f"\n💥 CRITICAL ERROR for {index_name}: {e}")
-            import traceback
-            traceback.print_exc()
+            instrument_key_idx = header.index('instrument_key')
+            name_idx = header.index('name')
+            expiry_idx = header.index('expiry')
+            instrument_type_idx = header.index('instrument_type')
+            exchange_idx = header.index('exchange')
+        except ValueError as e:
+            print(f"   ⚠️ CSV format issue: {e}")
+            return []
         
-        all_results[index_name] = fetcher
+        futures = []
         
-        # Delay between indices
-        await asyncio.sleep(2)
-    
-    # Final summary
-    print("\n\n" + "="*70)
-    print("📊 FINAL RESULTS")
-    print("="*70)
-    
-    for index_name, fetcher in all_results.items():
-        fetcher.print_summary()
-    
-    # Overall status
-    print("="*70)
-    print("🎯 OVERALL STATUS")
-    print("="*70)
-    
-    total_success = 0
-    total_tests = len(TEST_INDICES)
-    
-    for index_name, fetcher in all_results.items():
-        spot_ok = fetcher.results['spot']['status'] == 'success'
-        futures_ok = fetcher.results['futures']['status'] in ['success', 'warning']
-        options_ok = fetcher.results['options']['status'] == 'success'
+        for line in lines[1:]:
+            parts = line.split(',')
+            
+            if len(parts) <= max(instrument_key_idx, name_idx, expiry_idx, 
+                                instrument_type_idx, exchange_idx):
+                continue
+            
+            instrument_key = parts[instrument_key_idx]
+            name = parts[name_idx]
+            expiry = parts[expiry_idx]
+            inst_type = parts[instrument_type_idx]
+            exchange = parts[exchange_idx]
+            
+            # Filter: NSE_FO exchange, FUTIDX type, matching index
+            if (exchange == 'NSE_FO' and 
+                inst_type == 'FUTIDX' and 
+                index_prefix.upper() in name.upper()):
+                
+                futures.append({
+                    'instrument_key': instrument_key,
+                    'name': name,
+                    'expiry': expiry,
+                    'type': inst_type
+                })
         
-        all_ok = spot_ok and futures_ok and options_ok
-        
-        if all_ok:
-            status = "✅ READY"
-            total_success += 1
-        elif spot_ok:
-            status = "⚠️ PARTIAL"
-        else:
-            status = "❌ FAILED"
-        
-        print(f"{status} - {INDICES[index_name]['name']}")
-        
-        if not all_ok:
-            if not spot_ok:
-                print(f"   ⚠️ Spot: {fetcher.results['spot']['error']}")
-            if not futures_ok:
-                print(f"   ⚠️ Futures: {fetcher.results['futures']['error']}")
-            if not options_ok:
-                print(f"   ⚠️ Options: {fetcher.results['options']['error']}")
+        return futures
     
-    print("="*70)
-    print(f"📈 Success Rate: {total_success}/{total_tests} indices")
-    print(f"⏰ Completed: {datetime.now(IST).strftime('%d-%b %I:%M:%S %p')}")
-    print("="*70)
+    async def search_futures(self, index_name: str, session: aiohttp.ClientSession):
+        """Search futures for specific index"""
+        
+        print(f"\n{'='*70}")
+        print(f"🔍 SEARCHING: {index_name} FUTURES")
+        print(f"{'='*70}")
+        
+        # Download instruments
+        csv_content = await self.download_instruments(session)
+        
+        if not csv_content:
+            print(f"   ❌ Could not download instrument database")
+            return
+        
+        # Parse and filter
+        print(f"\n📊 Parsing {index_name} futures...")
+        futures = self.parse_instruments(csv_content, index_name)
+        
+        if not futures:
+            print(f"   ❌ No futures found for {index_name}")
+            return
+        
+        # Sort by expiry
+        futures.sort(key=lambda x: x['expiry'])
+        
+        print(f"\n✅ Found {len(futures)} {index_name} futures contracts:")
+        print(f"\n{'Instrument Key':<45} {'Name':<20} {'Expiry'}")
+        print("-" * 85)
+        
+        today = datetime.now(IST).date()
+        
+        for i, fut in enumerate(futures[:10]):  # Show first 10
+            instrument_key = fut['instrument_key']
+            name = fut['name']
+            expiry = fut['expiry']
+            
+            # Parse expiry
+            try:
+                expiry_date = datetime.strptime(expiry, '%Y-%m-%d').date()
+                
+                # Highlight current month
+                if expiry_date > today:
+                    marker = "👉 CURRENT"
+                    print(f"{instrument_key:<45} {name:<20} {expiry} {marker}")
+                    
+                    # Show this as the one to use
+                    if i == 0 or (i > 0 and futures[i-1]['expiry'] < str(today)):
+                        print(f"\n💡 USE THIS SYMBOL: {instrument_key}")
+                        print(f"   Expiry: {expiry}")
+                        print(f"   Name: {name}\n")
+                else:
+                    print(f"{instrument_key:<45} {name:<20} {expiry} (expired)")
+            except:
+                print(f"{instrument_key:<45} {name:<20} {expiry}")
+        
+        if len(futures) > 10:
+            print(f"\n... and {len(futures) - 10} more contracts")
+        
+        print("-" * 85)
     
-    # Recommendations
-    if total_success < total_tests:
-        print("\n💡 TROUBLESHOOTING:")
-        print("")
-        print("1️⃣ Token Issues (401 Unauthorized):")
-        print("   → Generate NEW token from Upstox")
-        print("   → Token expires daily!")
-        print("   → Update UPSTOX_ACCESS_TOKEN env var")
-        print("")
-        print("2️⃣ Market Closed:")
-        print("   → Futures candles only available during market hours")
-        print("   → Spot/Options available 24x7")
-        print("")
-        print("3️⃣ Rate Limits (429):")
-        print("   → Wait 1 minute and retry")
-        print("   → Upstox has strict rate limits")
-        print("")
-    else:
-        print("\n🎉 ALL TESTS PASSED!")
-        print("✅ Ready for full analysis code")
+    async def search_all_indices(self):
+        """Search all indices"""
+        
+        print("="*70)
+        print("🔍 UPSTOX INSTRUMENT SEARCH")
+        print("="*70)
+        print(f"⏰ Time: {datetime.now(IST).strftime('%d-%b %I:%M:%S %p')}")
+        print(f"🎯 Searching: {len(SEARCH_INDICES)} indices")
+        print("="*70)
+        
+        # Check token
+        if not UPSTOX_ACCESS_TOKEN:
+            print("\n❌ ERROR: UPSTOX_ACCESS_TOKEN not set!")
+            return
+        
+        print(f"\n✅ Token: {UPSTOX_ACCESS_TOKEN[:20]}...")
+        
+        async with aiohttp.ClientSession() as session:
+            for index_name in SEARCH_INDICES:
+                await self.search_futures(index_name, session)
+                await asyncio.sleep(1)  # Rate limit
+        
+        print("\n" + "="*70)
+        print("✅ SEARCH COMPLETE")
+        print("="*70)
+        print("\n💡 Copy the correct instrument keys from above")
+        print("   Update your code with these exact symbols")
+        print("="*70)
 
-# ==================== RUN ====================
+# ==================== MAIN ====================
+async def main():
+    """Main entry point"""
+    searcher = InstrumentSearcher()
+    await searcher.search_all_indices()
+
 if __name__ == "__main__":
     try:
-        asyncio.run(test_all_indices())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Test stopped")
+        print("\n\n👋 Search stopped")
     except Exception as e:
-        print(f"\n\n💥 Critical error: {e}")
+        print(f"\n\n💥 Error: {e}")
         import traceback
         traceback.print_exc()
