@@ -1,227 +1,256 @@
 #!/usr/bin/env python3
 """
-UPSTOX INSTRUMENT SEARCH
-========================
-Find correct futures symbols for NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY
+FUTURES SYMBOL FORMAT TESTER
+=============================
+Test different symbol formats to find working one
 
-This will search Upstox's instrument database and show:
-- Available futures contracts
-- Correct symbol format
-- Expiry dates
+We'll test:
+- NIFTY24NOVFUT vs NIFTY24NOV vs NIFTY24NOV25FUT
+- Different month variations
+- Different year formats
 
-Author: Instrument Search Tool
+Author: Symbol Tester
 Date: November 24, 2025
 """
 
 import asyncio
 import aiohttp
-import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+from calendar import monthrange
 import pytz
 
 # ==================== CONFIGURATION ====================
 IST = pytz.timezone('Asia/Kolkata')
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', '')
 
-# Indices to search
-SEARCH_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
-
-# ==================== INSTRUMENT SEARCHER ====================
-class InstrumentSearcher:
-    """Search Upstox instrument database"""
+# ==================== SYMBOL GENERATOR ====================
+class SymbolTester:
+    """Test different futures symbol formats"""
     
     def __init__(self):
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.base_url = "https://api.upstox.com/v2"
     
-    async def download_instruments(self, session: aiohttp.ClientSession):
+    def generate_symbol_variations(self, index_prefix: str):
         """
-        Download instrument master file from Upstox
-        This contains ALL available instruments
-        """
-        print("\n📥 Downloading Upstox Instrument Database...")
-        print("   (This may take 10-15 seconds)")
+        Generate all possible symbol variations for testing
         
-        # Upstox provides instrument CSV
-        url = f"{self.base_url}/instruments"
+        Patterns to test:
+        1. NIFTY24NOVFUT
+        2. NIFTY24NOV25FUT
+        3. NIFTY24NOV
+        4. NIFTYNOV24FUT
+        5. NIFTY2024NOVFUT
+        """
+        now = datetime.now(IST)
+        
+        # Current month
+        current_month = now.strftime('%b').upper()  # NOV
+        current_year_2digit = now.year % 100  # 24 (for 2024) or 25 (for 2025)
+        current_year_4digit = now.year  # 2025
+        
+        # Next month
+        next_month_date = now + timedelta(days=32)
+        next_month = next_month_date.strftime('%b').upper()  # DEC
+        next_month_year_2digit = next_month_date.year % 100
+        
+        # Previous month
+        prev_month_date = now - timedelta(days=32)
+        prev_month = prev_month_date.strftime('%b').upper()  # OCT
+        
+        # Contract year (April-March cycle)
+        contract_year = current_year_2digit
+        if now.month <= 3:  # Jan, Feb, Mar
+            contract_year = current_year_2digit - 1
+        
+        variations = []
+        
+        # Pattern 1: NIFTY24NOVFUT (Contract year + Month + FUT)
+        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{current_month}FUT")
+        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{next_month}FUT")
+        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{prev_month}FUT")
+        
+        # Pattern 2: NIFTY24NOV25FUT (Contract year + Month + Expiry year + FUT)
+        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{current_month}{current_year_2digit:02d}FUT")
+        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{next_month}{next_month_year_2digit:02d}FUT")
+        
+        # Pattern 3: NIFTY24NOV (No FUT suffix)
+        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{current_month}")
+        variations.append(f"NSE_FO|{index_prefix}{contract_year:02d}{next_month}")
+        
+        # Pattern 4: NIFTYNOV24FUT (Month + Year + FUT)
+        variations.append(f"NSE_FO|{index_prefix}{current_month}{current_year_2digit:02d}FUT")
+        variations.append(f"NSE_FO|{index_prefix}{next_month}{next_month_year_2digit:02d}FUT")
+        
+        # Pattern 5: NIFTY2024NOVFUT (Full year)
+        variations.append(f"NSE_FO|{index_prefix}{current_year_4digit}{current_month}FUT")
+        
+        # Pattern 6: Current year instead of contract year
+        variations.append(f"NSE_FO|{index_prefix}{current_year_2digit:02d}{current_month}FUT")
+        variations.append(f"NSE_FO|{index_prefix}{current_year_2digit:02d}{next_month}FUT")
+        
+        return variations
+    
+    async def test_symbol(self, symbol: str, session: aiohttp.ClientSession):
+        """Test if a symbol works by fetching LTP"""
+        
+        symbol_encoded = symbol.replace('|', '%7C')
+        url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={symbol_encoded}"
         
         try:
             async with session.get(url, headers=self.headers,
-                                 timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                                 timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 
                 if resp.status == 200:
-                    content = await resp.text()
-                    print(f"   ✅ Downloaded ({len(content)} bytes)")
-                    return content
+                    data = await resp.json()
+                    
+                    # Check if data exists
+                    if 'data' in data and symbol in data['data']:
+                        ltp = data['data'][symbol].get('last_price', 0)
+                        if ltp > 0:
+                            return True, ltp, None
+                    
+                    return False, 0, "No price data"
+                
+                elif resp.status == 404:
+                    return False, 0, "Symbol not found (404)"
+                
+                elif resp.status == 400:
+                    return False, 0, "Invalid format (400)"
+                
                 else:
                     error = await resp.text()
-                    print(f"   ❌ Failed: HTTP {resp.status}")
-                    print(f"   Error: {error[:200]}")
-                    return None
+                    return False, 0, f"HTTP {resp.status}"
+        
+        except asyncio.TimeoutError:
+            return False, 0, "Timeout"
         
         except Exception as e:
-            print(f"   ❌ Error: {e}")
-            return None
+            return False, 0, str(e)
     
-    def parse_instruments(self, csv_content: str, index_prefix: str):
-        """
-        Parse CSV and find futures for specific index
-        """
-        if not csv_content:
-            return []
-        
-        lines = csv_content.strip().split('\n')
-        
-        if len(lines) < 2:
-            return []
-        
-        # First line is header
-        header = lines[0].split(',')
-        
-        # Find column indices
-        try:
-            instrument_key_idx = header.index('instrument_key')
-            name_idx = header.index('name')
-            expiry_idx = header.index('expiry')
-            instrument_type_idx = header.index('instrument_type')
-            exchange_idx = header.index('exchange')
-        except ValueError as e:
-            print(f"   ⚠️ CSV format issue: {e}")
-            return []
-        
-        futures = []
-        
-        for line in lines[1:]:
-            parts = line.split(',')
-            
-            if len(parts) <= max(instrument_key_idx, name_idx, expiry_idx, 
-                                instrument_type_idx, exchange_idx):
-                continue
-            
-            instrument_key = parts[instrument_key_idx]
-            name = parts[name_idx]
-            expiry = parts[expiry_idx]
-            inst_type = parts[instrument_type_idx]
-            exchange = parts[exchange_idx]
-            
-            # Filter: NSE_FO exchange, FUTIDX type, matching index
-            if (exchange == 'NSE_FO' and 
-                inst_type == 'FUTIDX' and 
-                index_prefix.upper() in name.upper()):
-                
-                futures.append({
-                    'instrument_key': instrument_key,
-                    'name': name,
-                    'expiry': expiry,
-                    'type': inst_type
-                })
-        
-        return futures
-    
-    async def search_futures(self, index_name: str, session: aiohttp.ClientSession):
-        """Search futures for specific index"""
+    async def find_working_symbol(self, index_name: str, index_prefix: str):
+        """Find working symbol for an index"""
         
         print(f"\n{'='*70}")
-        print(f"🔍 SEARCHING: {index_name} FUTURES")
+        print(f"🔍 TESTING: {index_name}")
         print(f"{'='*70}")
         
-        # Download instruments
-        csv_content = await self.download_instruments(session)
+        variations = self.generate_symbol_variations(index_prefix)
         
-        if not csv_content:
-            print(f"   ❌ Could not download instrument database")
-            return
+        print(f"\n📋 Generated {len(variations)} symbol variations to test")
+        print(f"⏳ Testing each variation...\n")
         
-        # Parse and filter
-        print(f"\n📊 Parsing {index_name} futures...")
-        futures = self.parse_instruments(csv_content, index_name)
-        
-        if not futures:
-            print(f"   ❌ No futures found for {index_name}")
-            return
-        
-        # Sort by expiry
-        futures.sort(key=lambda x: x['expiry'])
-        
-        print(f"\n✅ Found {len(futures)} {index_name} futures contracts:")
-        print(f"\n{'Instrument Key':<45} {'Name':<20} {'Expiry'}")
-        print("-" * 85)
-        
-        today = datetime.now(IST).date()
-        
-        for i, fut in enumerate(futures[:10]):  # Show first 10
-            instrument_key = fut['instrument_key']
-            name = fut['name']
-            expiry = fut['expiry']
+        async with aiohttp.ClientSession() as session:
             
-            # Parse expiry
-            try:
-                expiry_date = datetime.strptime(expiry, '%Y-%m-%d').date()
+            working_symbols = []
+            
+            for i, symbol in enumerate(variations, 1):
+                print(f"{i:2d}. Testing: {symbol:<55}", end=" ")
                 
-                # Highlight current month
-                if expiry_date > today:
-                    marker = "👉 CURRENT"
-                    print(f"{instrument_key:<45} {name:<20} {expiry} {marker}")
-                    
-                    # Show this as the one to use
-                    if i == 0 or (i > 0 and futures[i-1]['expiry'] < str(today)):
-                        print(f"\n💡 USE THIS SYMBOL: {instrument_key}")
-                        print(f"   Expiry: {expiry}")
-                        print(f"   Name: {name}\n")
+                success, ltp, error = await self.test_symbol(symbol, session)
+                
+                if success:
+                    print(f"✅ WORKS! Price: ₹{ltp}")
+                    working_symbols.append({
+                        'symbol': symbol,
+                        'ltp': ltp
+                    })
                 else:
-                    print(f"{instrument_key:<45} {name:<20} {expiry} (expired)")
-            except:
-                print(f"{instrument_key:<45} {name:<20} {expiry}")
-        
-        if len(futures) > 10:
-            print(f"\n... and {len(futures) - 10} more contracts")
-        
-        print("-" * 85)
+                    print(f"❌ {error}")
+                
+                # Small delay to avoid rate limits
+                await asyncio.sleep(0.5)
+            
+            print(f"\n{'='*70}")
+            
+            if working_symbols:
+                print(f"✅ FOUND {len(working_symbols)} WORKING SYMBOL(S):\n")
+                for item in working_symbols:
+                    print(f"   💡 {item['symbol']}")
+                    print(f"      Last Price: ₹{item['ltp']}")
+                    print()
+            else:
+                print(f"❌ NO WORKING SYMBOLS FOUND")
+            
+            print(f"{'='*70}")
+            
+            return working_symbols
     
-    async def search_all_indices(self):
-        """Search all indices"""
+    async def test_all_indices(self):
+        """Test all indices"""
+        
+        indices = {
+            'NIFTY': 'NIFTY',
+            'BANKNIFTY': 'BANKNIFTY',
+            'FINNIFTY': 'FINNIFTY',
+            'MIDCPNIFTY': 'MIDCPNIFTY'
+        }
         
         print("="*70)
-        print("🔍 UPSTOX INSTRUMENT SEARCH")
+        print("🧪 FUTURES SYMBOL FORMAT TESTER")
         print("="*70)
         print(f"⏰ Time: {datetime.now(IST).strftime('%d-%b %I:%M:%S %p')}")
-        print(f"🎯 Searching: {len(SEARCH_INDICES)} indices")
+        print(f"🎯 Testing: {len(indices)} indices")
         print("="*70)
         
-        # Check token
         if not UPSTOX_ACCESS_TOKEN:
             print("\n❌ ERROR: UPSTOX_ACCESS_TOKEN not set!")
             return
         
         print(f"\n✅ Token: {UPSTOX_ACCESS_TOKEN[:20]}...")
         
-        async with aiohttp.ClientSession() as session:
-            for index_name in SEARCH_INDICES:
-                await self.search_futures(index_name, session)
-                await asyncio.sleep(1)  # Rate limit
+        all_results = {}
+        
+        for index_name, index_prefix in indices.items():
+            results = await self.find_working_symbol(index_name, index_prefix)
+            all_results[index_name] = results
+            await asyncio.sleep(2)  # Delay between indices
+        
+        # Final Summary
+        print("\n\n" + "="*70)
+        print("📊 FINAL RESULTS")
+        print("="*70)
+        
+        for index_name, results in all_results.items():
+            if results:
+                print(f"\n✅ {index_name}:")
+                for item in results:
+                    print(f"   {item['symbol']}")
+            else:
+                print(f"\n❌ {index_name}: No working symbols found")
         
         print("\n" + "="*70)
-        print("✅ SEARCH COMPLETE")
+        print("🎯 SUMMARY")
         print("="*70)
-        print("\n💡 Copy the correct instrument keys from above")
-        print("   Update your code with these exact symbols")
+        
+        total_found = sum(len(r) for r in all_results.values())
+        
+        if total_found > 0:
+            print(f"\n✅ Found {total_found} working symbols!")
+            print("\n💡 Copy the working symbols and update your data fetching code")
+        else:
+            print("\n❌ No working symbols found")
+            print("\n💡 Possible issues:")
+            print("   1. Token expired/invalid")
+            print("   2. Market closed (but LTP should still work)")
+            print("   3. Upstox API format changed")
+        
         print("="*70)
 
 # ==================== MAIN ====================
 async def main():
     """Main entry point"""
-    searcher = InstrumentSearcher()
-    await searcher.search_all_indices()
+    tester = SymbolTester()
+    await tester.test_all_indices()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n👋 Search stopped")
+        print("\n\n👋 Testing stopped")
     except Exception as e:
         print(f"\n\n💥 Error: {e}")
         import traceback
