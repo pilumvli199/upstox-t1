@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-NIFTY OPTIONS BOT V12.0 - STRIKE MASTER
-========================================
-Multi-Factor Strike Analysis Bot with FIXED Futures Data Fetching
+NIFTY OPTIONS BOT V12.0 - STRIKE MASTER (PRODUCTION FIXED)
+==========================================================
+Multi-Factor Strike Analysis Bot with Enhanced Error Handling
 
 Author: Data Monster Team
-Version: 12.0 - Production Ready with Intraday + Historical API
+Version: 12.0 - Production Ready - COMPLETE CODE
 """
 
 import os
@@ -17,7 +17,7 @@ import pytz
 import json
 import logging
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 import pandas as pd
 import numpy as np
 from calendar import monthrange
@@ -68,14 +68,14 @@ INDICES = {
     'BANKNIFTY': {
         'spot': "NSE_INDEX|Nifty Bank",
         'name': 'BANK NIFTY',
-        'expiry_type': 'monthly',
-        'expiry_day': 1,
+        'expiry_type': 'weekly',
+        'expiry_day': 2,
         'strike_gap': 100
     },
     'FINNIFTY': {
         'spot': "NSE_INDEX|Nifty Fin Service",
         'name': 'FIN NIFTY',
-        'expiry_type': 'monthly',
+        'expiry_type': 'weekly',
         'expiry_day': 1,
         'strike_gap': 50
     },
@@ -136,11 +136,11 @@ class Signal:
 
 # ==================== INSTRUMENTS CACHE ====================
 class InstrumentsCache:
-    """Global cache for instruments data"""
+    """Global cache for instruments data with improved error handling"""
     _instance = None
     _instruments_map = {}
     _last_update = None
-    _update_interval = timedelta(hours=6)  # Refresh every 6 hours
+    _update_interval = timedelta(hours=6)
     
     @classmethod
     def get_instance(cls):
@@ -149,10 +149,9 @@ class InstrumentsCache:
         return cls._instance
     
     async def load_instruments(self) -> bool:
-        """Download and cache instruments data"""
+        """Download and cache instruments data with retry logic"""
         now = datetime.now(IST)
         
-        # Check if we need to update
         if self._last_update and (now - self._last_update) < self._update_interval:
             if self._instruments_map:
                 logger.info(f"Using cached instruments (last updated: {self._last_update.strftime('%H:%M')})")
@@ -160,97 +159,107 @@ class InstrumentsCache:
         
         logger.info("📥 Downloading Upstox instruments...")
         
-        async with aiohttp.ClientSession() as session:
+        retry_count = 3
+        for attempt in range(retry_count):
             try:
-                async with session.get(INSTRUMENTS_JSON_URL) as resp:
-                    if resp.status == 200:
-                        compressed = await resp.read()
-                        decompressed = gzip.decompress(compressed)
-                        instruments = json.loads(decompressed)
-                        
-                        # Build futures map
-                        self._instruments_map = {}
-                        
-                        for instrument in instruments:
-                            if instrument.get('segment') != 'NSE_FO':
-                                continue
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(INSTRUMENTS_JSON_URL, timeout=30) as resp:
+                        if resp.status == 200:
+                            compressed = await resp.read()
+                            decompressed = gzip.decompress(compressed)
+                            instruments = json.loads(decompressed)
                             
-                            if instrument.get('instrument_type') != 'FUT':
-                                continue
+                            self._instruments_map = {}
                             
-                            name = instrument.get('name', '')
-                            if name not in ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']:
-                                continue
+                            for instrument in instruments:
+                                try:
+                                    if instrument.get('segment') != 'NSE_FO':
+                                        continue
+                                    
+                                    if instrument.get('instrument_type') != 'FUT':
+                                        continue
+                                    
+                                    name = instrument.get('name', '')
+                                    if name not in ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']:
+                                        continue
+                                    
+                                    expiry_ms = instrument.get('expiry', 0)
+                                    if not expiry_ms:
+                                        continue
+                                    
+                                    expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
+                                    
+                                    if expiry_dt < now:
+                                        continue
+                                    
+                                    if name not in self._instruments_map:
+                                        self._instruments_map[name] = {
+                                            'instrument_key': instrument.get('instrument_key'),
+                                            'trading_symbol': instrument.get('trading_symbol'),
+                                            'expiry': expiry_dt.strftime('%d-%b-%Y'),
+                                            'expiry_timestamp': expiry_ms
+                                        }
+                                    else:
+                                        if expiry_ms < self._instruments_map[name]['expiry_timestamp']:
+                                            self._instruments_map[name] = {
+                                                'instrument_key': instrument.get('instrument_key'),
+                                                'trading_symbol': instrument.get('trading_symbol'),
+                                                'expiry': expiry_dt.strftime('%d-%b-%Y'),
+                                                'expiry_timestamp': expiry_ms
+                                            }
+                                except Exception as e:
+                                    logger.debug(f"Error processing instrument: {e}")
+                                    continue
                             
-                            expiry_ms = instrument.get('expiry', 0)
-                            if not expiry_ms:
-                                continue
+                            self._last_update = now
                             
-                            expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
+                            logger.info(f"✅ Loaded futures instruments:")
+                            for name, info in self._instruments_map.items():
+                                logger.info(f"   {name}: {info['instrument_key']} (Expiry: {info['expiry']})")
                             
-                            # Skip expired
-                            if expiry_dt < now:
-                                continue
-                            
-                            # Store nearest expiry for each index
-                            if name not in self._instruments_map:
-                                self._instruments_map[name] = {
-                                    'instrument_key': instrument.get('instrument_key'),
-                                    'trading_symbol': instrument.get('trading_symbol'),
-                                    'expiry': expiry_dt.strftime('%d-%b-%Y'),
-                                    'expiry_timestamp': expiry_ms
-                                }
-                            else:
-                                # Keep nearest expiry
-                                if expiry_ms < self._instruments_map[name]['expiry_timestamp']:
-                                    self._instruments_map[name] = {
-                                        'instrument_key': instrument.get('instrument_key'),
-                                        'trading_symbol': instrument.get('trading_symbol'),
-                                        'expiry': expiry_dt.strftime('%d-%b-%Y'),
-                                        'expiry_timestamp': expiry_ms
-                                    }
-                        
-                        self._last_update = now
-                        
-                        logger.info(f"✅ Loaded futures instruments:")
-                        for name, info in self._instruments_map.items():
-                            logger.info(f"   {name}: {info['instrument_key']} (Expiry: {info['expiry']})")
-                        
-                        return True
-                    else:
-                        logger.error(f"❌ HTTP {resp.status}")
-                        return False
+                            return True
+                        else:
+                            logger.warning(f"HTTP {resp.status} on attempt {attempt + 1}")
+                            if attempt < retry_count - 1:
+                                await asyncio.sleep(5 * (attempt + 1))
             
             except Exception as e:
-                logger.error(f"💥 Download failed: {e}")
-                return False
+                logger.error(f"Download attempt {attempt + 1} failed: {e}")
+                if attempt < retry_count - 1:
+                    await asyncio.sleep(5 * (attempt + 1))
+        
+        logger.error("❌ Failed to load instruments after all retries")
+        return False
     
     def get_futures_key(self, index_name: str) -> Optional[str]:
         """Get instrument key for index futures"""
-        if index_name in self._instruments_map:
-            return self._instruments_map[index_name]['instrument_key']
-        return None
+        return self._instruments_map.get(index_name, {}).get('instrument_key')
 
 def get_expiry_date(index_name: str = 'NIFTY') -> str:
+    """Calculate next expiry date for given index"""
     now = datetime.now(IST)
     today = now.date()
     index_config = INDICES[index_name]
     
     if index_config['expiry_type'] == 'weekly':
-        days_until_tuesday = (1 - today.weekday() + 7) % 7
-        if days_until_tuesday == 0 and now.time() > time(15, 30):
+        target_weekday = index_config['expiry_day']
+        days_until_expiry = (target_weekday - today.weekday() + 7) % 7
+        
+        if days_until_expiry == 0 and now.time() > time(15, 30):
             expiry = today + timedelta(days=7)
         else:
-            expiry = today + timedelta(days=days_until_tuesday if days_until_tuesday > 0 else 7)
+            expiry = today + timedelta(days=days_until_expiry if days_until_expiry > 0 else 7)
     else:
         year = now.year
         month = now.month
         last_day = monthrange(year, month)[1]
         last_date = datetime(year, month, last_day).date()
-        days_to_tuesday = (last_date.weekday() - 1) % 7
-        last_tuesday = last_date - timedelta(days=days_to_tuesday)
         
-        if (today > last_tuesday) or (today == last_tuesday and now.time() > time(15, 30)):
+        target_weekday = index_config['expiry_day']
+        days_to_target = (last_date.weekday() - target_weekday) % 7
+        last_target_day = last_date - timedelta(days=days_to_target)
+        
+        if (today > last_target_day) or (today == last_target_day and now.time() > time(15, 30)):
             if month == 12:
                 year += 1
                 month = 1
@@ -258,30 +267,37 @@ def get_expiry_date(index_name: str = 'NIFTY') -> str:
                 month += 1
             last_day = monthrange(year, month)[1]
             last_date = datetime(year, month, last_day).date()
-            days_to_tuesday = (last_date.weekday() - 1) % 7
-            expiry = last_date - timedelta(days=days_to_tuesday)
+            days_to_target = (last_date.weekday() - target_weekday) % 7
+            expiry = last_date - timedelta(days=days_to_target)
         else:
-            expiry = last_tuesday
+            expiry = last_target_day
     
     return expiry.strftime('%Y-%m-%d')
 
 def is_data_collection_time() -> bool:
+    """Check if current time is within market hours"""
     now = datetime.now(IST).time()
     return time(9, 15) <= now <= time(15, 30)
 
 def is_tradeable_time() -> bool:
+    """Check if current time is suitable for trading signals"""
     now = datetime.now(IST).time()
+    
     if not (time(9, 15) <= now <= time(15, 30)):
         return False
+    
     if AVOID_OPENING[0] <= now <= AVOID_OPENING[1]:
         logger.info("Opening window - Data collection only")
         return False
+    
     if AVOID_CLOSING[0] <= now <= AVOID_CLOSING[1]:
         logger.info("Closing window - Avoiding manipulation")
         return False
+    
     return True
 
 class RedisBrain:
+    """Memory system for historical data storage"""
     def __init__(self):
         self.client = None
         self.memory = {}
@@ -298,6 +314,7 @@ class RedisBrain:
             logger.info("💾 RAM-only mode")
     
     def save_strike_snapshot(self, strike_data: Dict[int, dict]):
+        """Save current strike data for historical comparison"""
         now = datetime.now(IST)
         timestamp = now.replace(second=0, microsecond=0)
         
@@ -315,6 +332,7 @@ class RedisBrain:
                 self.memory[key] = value
     
     def get_strike_oi_change(self, strike: int, current_data: dict, minutes_ago: int = 15) -> Tuple[float, float]:
+        """Calculate OI change for a strike over specified time period"""
         now = datetime.now(IST) - timedelta(minutes=minutes_ago)
         timestamp = now.replace(second=0, microsecond=0)
         key = f"strike:{strike}:{timestamp.strftime('%H%M')}"
@@ -341,6 +359,7 @@ class RedisBrain:
             return 0.0, 0.0
     
     def save_total_oi_snapshot(self, ce_total: int, pe_total: int):
+        """Save total OI for market-wide analysis"""
         now = datetime.now(IST)
         slot = now.replace(second=0, microsecond=0)
         key = f"total_oi:{slot.strftime('%H%M')}"
@@ -355,6 +374,7 @@ class RedisBrain:
             self.memory[key] = data
     
     def get_total_oi_change(self, current_ce: int, current_pe: int, minutes_ago: int = 15) -> Tuple[float, float]:
+        """Calculate total OI change across all strikes"""
         now = datetime.now(IST) - timedelta(minutes=minutes_ago)
         slot = now.replace(second=0, microsecond=0)
         key = f"total_oi:{slot.strftime('%H%M')}"
@@ -380,20 +400,25 @@ class RedisBrain:
             return 0.0, 0.0
 
 class StrikeDataFeed:
+    """Data fetching and processing engine"""
     def __init__(self, index_name: str = 'NIFTY'):
         self.index_name = index_name
         self.index_config = INDICES[index_name]
         self.spot_symbol = self.index_config['spot']
-        self.headers = {"Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}", "Accept": "application/json"}
+        self.headers = {
+            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+            "Accept": "application/json"
+        }
         self.retry_count = 3
         self.base_retry_delay = 2
         self.instruments_cache = InstrumentsCache.get_instance()
         logger.info(f"🎯 Initialized {self.index_config['name']}")
     
-    async def fetch_with_retry(self, url: str, session: aiohttp.ClientSession):
+    async def fetch_with_retry(self, url: str, session: aiohttp.ClientSession, timeout: int = 15):
+        """Fetch data with exponential backoff retry"""
         for attempt in range(self.retry_count):
             try:
-                async with session.get(url, headers=self.headers) as resp:
+                async with session.get(url, headers=self.headers, timeout=timeout) as resp:
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
@@ -401,19 +426,19 @@ class StrikeDataFeed:
                         logger.warning(f"⏳ Rate limited, waiting {wait_time}s")
                         await asyncio.sleep(wait_time)
                     else:
-                        logger.error(f"❌ HTTP {resp.status}")
-                        await asyncio.sleep(self.base_retry_delay)
-            except Exception as e:
-                logger.error(f"💥 Attempt {attempt+1}: {e}")
+                        logger.warning(f"HTTP {resp.status} on attempt {attempt + 1}")
+                        await asyncio.sleep(self.base_retry_delay * (attempt + 1))
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout on attempt {attempt + 1}")
                 await asyncio.sleep(self.base_retry_delay * (attempt + 1))
+            except Exception as e:
+                logger.error(f"Request error on attempt {attempt + 1}: {e}")
+                await asyncio.sleep(self.base_retry_delay * (attempt + 1))
+        
         return None
     
     async def fetch_futures_data(self, instrument_key: str, session: aiohttp.ClientSession) -> pd.DataFrame:
-        """
-        Fetch futures data using DUAL API APPROACH:
-        1. Try INTRADAY API first (live today's data)
-        2. Fallback to HISTORICAL API if intraday fails
-        """
+        """Fetch futures candle data using dual API approach"""
         now = datetime.now(IST)
         market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
         market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -421,10 +446,10 @@ class StrikeDataFeed:
         
         enc_key = urllib.parse.quote(instrument_key)
         
-        # Try INTRADAY API first (only returns today's data)
+        # Try INTRADAY API first (current day only)
         if is_market_hours:
             intraday_url = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_key}/1minute"
-            logger.info(f"📊 Trying INTRADAY API for live data...")
+            logger.info(f"📊 Fetching intraday data...")
             
             intraday_data = await self.fetch_with_retry(intraday_url, session)
             
@@ -432,21 +457,24 @@ class StrikeDataFeed:
                 candles = intraday_data.get('data', {}).get('candles', [])
                 
                 if candles and len(candles) > 0:
-                    df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
-                    df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
-                    df = df.sort_values('ts').set_index('ts')
-                    df = df.tail(100)  # Last 100 candles
-                    
-                    latest_time = df.index[-1]
-                    data_age = (now - latest_time).total_seconds() / 60
-                    
-                    logger.info(f"✅ INTRADAY: {len(df)} candles | Latest: {latest_time.strftime('%I:%M %p')} ({data_age:.1f}m ago)")
-                    return df
+                    try:
+                        df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
+                        df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
+                        df = df.sort_values('ts').set_index('ts')
+                        df = df.tail(100)
+                        
+                        latest_time = df.index[-1]
+                        data_age = (now - latest_time).total_seconds() / 60
+                        
+                        logger.info(f"✅ INTRADAY: {len(df)} candles | Latest: {latest_time.strftime('%I:%M %p')} ({data_age:.1f}m ago)")
+                        return df
+                    except Exception as e:
+                        logger.error(f"Error processing intraday data: {e}")
         
         # Fallback to HISTORICAL API
-        logger.info(f"📈 Using HISTORICAL API...")
+        logger.info(f"📈 Fetching historical data...")
         to_date = now.strftime('%Y-%m-%d')
-        from_date = (now - timedelta(days=3)).strftime('%Y-%m-%d')
+        from_date = (now - timedelta(days=5)).strftime('%Y-%m-%d')
         historical_url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_date}/{from_date}"
         
         historical_data = await self.fetch_with_retry(historical_url, session)
@@ -455,27 +483,28 @@ class StrikeDataFeed:
             candles = historical_data.get('data', {}).get('candles', [])
             
             if candles:
-                df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
-                df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
-                df = df.sort_values('ts').set_index('ts')
-                
-                # Filter to today's data
-                today = now.date()
-                df = df[df.index.date == today]
-                df = df.tail(100)
-                
-                if not df.empty:
-                    latest_time = df.index[-1]
-                    logger.info(f"✅ HISTORICAL: {len(df)} candles | Latest: {latest_time.strftime('%I:%M %p')}")
-                    return df
+                try:
+                    df = pd.DataFrame(candles, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'oi'])
+                    df['ts'] = pd.to_datetime(df['ts']).dt.tz_convert(IST)
+                    df = df.sort_values('ts').set_index('ts')
+                    
+                    # Filter to today's data
+                    today = now.date()
+                    df = df[df.index.date == today]
+                    df = df.tail(100)
+                    
+                    if not df.empty:
+                        latest_time = df.index[-1]
+                        logger.info(f"✅ HISTORICAL: {len(df)} candles | Latest: {latest_time.strftime('%I:%M %p')}")
+                        return df
+                except Exception as e:
+                    logger.error(f"Error processing historical data: {e}")
         
         logger.warning(f"⚠️ No futures data available")
         return pd.DataFrame()
     
     async def get_market_data(self) -> Tuple[pd.DataFrame, Dict[int, dict], str, float, float, float]:
-        """Fetch complete market data with improved futures fetching"""
-        
-        # Load instruments cache
+        """Fetch complete market snapshot"""
         await self.instruments_cache.load_instruments()
         
         async with aiohttp.ClientSession() as session:
@@ -500,7 +529,7 @@ class StrikeDataFeed:
                 logger.error("❌ Failed to fetch spot price")
                 return df, strike_data, "", 0, 0, 0
             
-            # 2. Fetch Futures Data (Using Instruments Cache)
+            # 2. Fetch Futures Data
             futures_key = self.instruments_cache.get_futures_key(self.index_name)
             
             if futures_key:
@@ -545,14 +574,18 @@ class StrikeDataFeed:
                         }
                         total_options_volume += (call_data.get('volume', 0) + put_data.get('volume', 0))
                 logger.info(f"✅ Collected {len(strike_data)} strikes")
+            else:
+                logger.error("❌ Failed to fetch option chain")
             
             return df, strike_data, expiry, spot_price, futures_price, total_options_volume
 
 class StrikeAnalyzer:
+    """Technical analysis and signal generation engine"""
     def __init__(self):
         self.volume_history = []
     
     def calculate_vwap(self, df: pd.DataFrame) -> float:
+        """Calculate Volume Weighted Average Price"""
         if df.empty:
             return 0
         df_copy = df.copy()
@@ -565,6 +598,7 @@ class StrikeAnalyzer:
         return vwap.iloc[-1]
     
     def calculate_atr(self, df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
+        """Calculate Average True Range"""
         if len(df) < period:
             return 30
         df_copy = df.tail(period).copy()
@@ -575,6 +609,7 @@ class StrikeAnalyzer:
         return df_copy['tr'].mean()
     
     def get_candle_info(self, df: pd.DataFrame) -> Tuple[str, float]:
+        """Get current candle color and size"""
         if df.empty:
             return 'NEUTRAL', 0
         last = df.iloc[-1]
@@ -588,25 +623,32 @@ class StrikeAnalyzer:
         return color, candle_size
     
     def check_volume_surge(self, current_vol: float) -> Tuple[bool, float]:
+        """Detect unusual volume spikes"""
         now = datetime.now(IST)
         self.volume_history.append({'time': now, 'volume': current_vol})
         cutoff = now - timedelta(minutes=20)
         self.volume_history = [x for x in self.volume_history if x['time'] > cutoff]
+        
         if len(self.volume_history) < 5:
             return False, 0
+        
         past_volumes = [x['volume'] for x in self.volume_history[:-1]]
         avg_vol = sum(past_volumes) / len(past_volumes)
+        
         if avg_vol == 0:
             return False, 0
+        
         multiplier = current_vol / avg_vol
         return multiplier >= VOL_SPIKE_2X, multiplier
     
     def calculate_focused_pcr(self, strike_data: Dict[int, dict]) -> float:
+        """Calculate Put-Call Ratio"""
         total_ce = sum(data['ce_oi'] for data in strike_data.values())
         total_pe = sum(data['pe_oi'] for data in strike_data.values())
         return total_pe / total_ce if total_ce > 0 else 1.0
     
     def analyze_atm_battle(self, strike_data: Dict[int, dict], atm_strike: int, redis_brain) -> Tuple[float, float]:
+        """Analyze ATM strike OI changes"""
         if atm_strike not in strike_data:
             return 0, 0
         current = strike_data[atm_strike]
@@ -615,6 +657,7 @@ class StrikeAnalyzer:
         return ce_15m, pe_15m
     
     def check_momentum(self, df: pd.DataFrame, direction: str = 'bullish') -> bool:
+        """Check if last 3 candles show momentum"""
         if df.empty or len(df) < 3:
             return False
         last_3 = df.tail(3)
@@ -624,6 +667,7 @@ class StrikeAnalyzer:
             return sum(last_3['close'] < last_3['open']) >= 2
 
 class StrikeMasterBot:
+    """Main bot orchestrator"""
     def __init__(self, index_name: str = 'NIFTY'):
         self.index_name = index_name
         self.index_config = INDICES[index_name]
@@ -639,9 +683,10 @@ class StrikeMasterBot:
                 self.telegram = Bot(token=TELEGRAM_BOT_TOKEN)
                 logger.info("✅ Telegram Ready")
             except Exception as e:
-                logger.warning(f"⚠️ Telegram: {e}")
+                logger.warning(f"⚠️ Telegram init error: {e}")
     
     async def run_cycle(self):
+        """Execute one complete analysis cycle"""
         if not is_data_collection_time():
             return
         
@@ -649,52 +694,58 @@ class StrikeMasterBot:
         logger.info(f"🔍 STRIKE MASTER SCAN - {self.index_config['name']}")
         logger.info(f"{'='*60}")
         
-        df, strike_data, expiry, spot, futures, vol = await self.feed.get_market_data()
+        try:
+            df, strike_data, expiry, spot, futures, vol = await self.feed.get_market_data()
+            
+            if df.empty or not strike_data or spot == 0:
+                logger.warning("⚠️ Incomplete data - skipping cycle")
+                return
+            
+            vwap = self.analyzer.calculate_vwap(df)
+            atr = self.analyzer.calculate_atr(df)
+            pcr = self.analyzer.calculate_focused_pcr(strike_data)
+            candle_color, candle_size = self.analyzer.get_candle_info(df)
+            has_vol_spike, vol_mult = self.analyzer.check_volume_surge(vol)
+            
+            strike_gap = self.index_config['strike_gap']
+            atm_strike = round(spot / strike_gap) * strike_gap
+            atm_ce_15m, atm_pe_15m = self.analyzer.analyze_atm_battle(strike_data, atm_strike, self.redis)
+            
+            total_ce = sum(d['ce_oi'] for d in strike_data.values())
+            total_pe = sum(d['pe_oi'] for d in strike_data.values())
+            ce_total_15m, pe_total_15m = self.redis.get_total_oi_change(total_ce, total_pe, 15)
+            
+            self.redis.save_strike_snapshot(strike_data)
+            self.redis.save_total_oi_snapshot(total_ce, total_pe)
+            
+            logger.info(f"📊 Spot: ₹{spot:.2f} | Futures: ₹{futures:.2f} | PCR: {pcr:.2f}")
+            logger.info(f"📈 VWAP: ₹{vwap:.2f} | ATR: {atr:.1f} | Candle: {candle_color}")
+            logger.info(f"📉 OI 15m: CE={ce_total_15m:+.1f}% PE={pe_total_15m:+.1f}%")
+            
+            if is_tradeable_time():
+                signal = self.generate_signal(
+                    spot, futures, vwap, abs(futures - vwap), pcr, atr,
+                    ce_total_15m, pe_total_15m, 0, 0,
+                    atm_ce_15m, atm_pe_15m,
+                    candle_color, candle_size,
+                    has_vol_spike, vol_mult, df
+                )
+                if signal:
+                    await self.send_alert(signal)
+            else:
+                logger.info("📊 Data collected (avoid window)")
+            
+            logger.info(f"{'='*60}\n")
         
-        if df.empty or not strike_data or spot == 0: 0:
-            logger.warning("⚠️ Incomplete data - skipping cycle")
-            return
-        
-        vwap = self.analyzer.calculate_vwap(df)
-        atr = self.analyzer.calculate_atr(df)
-        pcr = self.analyzer.calculate_focused_pcr(strike_data)
-        candle_color, candle_size = self.analyzer.get_candle_info(df)
-        has_vol_spike, vol_mult = self.analyzer.check_volume_surge(vol)
-        
-        strike_gap = self.index_config['strike_gap']
-        atm_strike = round(spot / strike_gap) * strike_gap
-        atm_ce_15m, atm_pe_15m = self.analyzer.analyze_atm_battle(strike_data, atm_strike, self.redis)
-        
-        total_ce = sum(d['ce_oi'] for d in strike_data.values())
-        total_pe = sum(d['pe_oi'] for d in strike_data.values())
-        ce_total_15m, pe_total_15m = self.redis.get_total_oi_change(total_ce, total_pe, 15)
-        
-        self.redis.save_strike_snapshot(strike_data)
-        self.redis.save_total_oi_snapshot(total_ce, total_pe)
-        
-        logger.info(f"📊 Spot: ₹{spot:.2f} | Futures: ₹{futures:.2f} | PCR: {pcr:.2f}")
-        logger.info(f"📈 VWAP: ₹{vwap:.2f} | ATR: {atr:.1f} | Candle: {candle_color}")
-        logger.info(f"📉 OI 15m: CE={ce_total_15m:+.1f}% PE={pe_total_15m:+.1f}%")
-        
-        if is_tradeable_time():
-            signal = self.generate_signal(
-                spot, futures, vwap, abs(futures - vwap), pcr, atr,
-                ce_total_15m, pe_total_15m, 0, 0,
-                atm_ce_15m, atm_pe_15m,
-                candle_color, candle_size,
-                has_vol_spike, vol_mult, df
-            )
-            if signal:
-                await self.send_alert(signal)
-        else:
-            logger.info("📊 Data collected (avoid window)")
-        
-        logger.info(f"{'='*60}\n")
+        except Exception as e:
+            logger.error(f"💥 Error in cycle: {e}")
+            logger.exception("Full traceback:")
     
     def generate_signal(self, spot_price, futures_price, vwap, vwap_distance, pcr, atr,
                        ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
                        atm_ce_change, atm_pe_change, candle_color, candle_size,
                        has_vol_spike, vol_mult, df) -> Optional[Signal]:
+        """Generate trading signals based on multi-factor analysis"""
         
         strike_gap = self.index_config['strike_gap']
         strike = round(spot_price / strike_gap) * strike_gap
@@ -801,6 +852,7 @@ class StrikeMasterBot:
         return None
     
     async def send_alert(self, s: Signal):
+        """Send trading alert via Telegram"""
         if self.last_alert_time:
             elapsed = (datetime.now(IST) - self.last_alert_time).seconds
             if elapsed < self.alert_cooldown:
@@ -848,9 +900,10 @@ class StrikeMasterBot:
                 await self.telegram.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
                 logger.info("✅ Telegram alert sent")
             except Exception as e:
-                logger.error(f"❌ Telegram error: {e}")
+                logger.error(f"❌ Telegram send error: {e}")
     
     async def send_startup_message(self):
+        """Send bot startup notification"""
         now = datetime.now(IST)
         startup_time = now.strftime('%d-%b %I:%M %p')
         mode = "🔔 ALERT ONLY" if ALERT_ONLY_MODE else "🟢 LIVE TRADING"
@@ -884,6 +937,7 @@ Ready to scan! 🎯
                 logger.error(f"❌ Startup message error: {e}")
 
 async def main():
+    """Main entry point"""
     if ACTIVE_INDEX not in INDICES:
         logger.error(f"❌ Invalid ACTIVE_INDEX: {ACTIVE_INDEX}")
         return
@@ -891,7 +945,7 @@ async def main():
     bot = StrikeMasterBot(ACTIVE_INDEX)
     
     logger.info("=" * 80)
-    logger.info("🚀 STRIKE MASTER V12 - PRODUCTION READY")
+    logger.info("🚀 STRIKE MASTER V12 - PRODUCTION READY (COMPLETE)")
     logger.info("=" * 80)
     logger.info(f"📊 Index: {bot.index_config['name']}")
     logger.info(f"🔔 Mode: {'ALERT ONLY' if ALERT_ONLY_MODE else 'LIVE TRADING'}")
@@ -915,7 +969,6 @@ async def main():
                 await bot.run_cycle()
                 await asyncio.sleep(SCAN_INTERVAL)
             else:
-                # Market closed - wait 5 minutes
                 logger.info("😴 Market closed - waiting...")
                 await asyncio.sleep(300)
         
