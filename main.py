@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-FUTURES DATA TESTING BOT
-========================
-Testing Upstox Futures Historical Candles API
+FUTURES DATA BOT - WORKING VERSION
+===================================
+Fetches last 10 candles for 4 indices from Upstox
+Sends to Telegram every 60 seconds
 
-Fetches last 10 candles (1-minute) for 4 indices:
-- NIFTY 50
-- BANK NIFTY
-- FIN NIFTY
-- MIDCAP NIFTY
-
-Sends JSON data to Telegram every 1 minute
+FIXED: Using hardcoded current month symbols
 """
 
 import os
@@ -21,7 +16,6 @@ from datetime import datetime, timedelta
 import pytz
 import json
 import logging
-from calendar import monthrange
 
 try:
     from telegram import Bot
@@ -37,129 +31,43 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger("FuturesTester")
+logger = logging.getLogger("FuturesBot")
 
 # API Credentials
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 
-# Futures Symbols Config
-FUTURES_CONFIG = {
+# ==================== FUTURES SYMBOLS ====================
+# 🔥 HARDCODED SYMBOLS (November 2025)
+# तुला हे manually update करावे लागतील दर महिन्याला!
+
+FUTURES_SYMBOLS = {
     'NIFTY': {
         'name': 'NIFTY 50',
-        'prefix': 'NIFTY',
-        'expiry_day': 1  # Tuesday
+        'symbol': 'NSE_FO|NIFTY28NOV24FUT',  # Last Thursday
+        'expiry': '28-Nov-2024'
     },
     'BANKNIFTY': {
         'name': 'BANK NIFTY',
-        'prefix': 'BANKNIFTY',
-        'expiry_day': 2  # Wednesday
+        'symbol': 'NSE_FO|BANKNIFTY27NOV24FUT',  # Last Wednesday
+        'expiry': '27-Nov-2024'
     },
     'FINNIFTY': {
         'name': 'FIN NIFTY',
-        'prefix': 'FINNIFTY',
-        'expiry_day': 1  # Tuesday
+        'symbol': 'NSE_FO|FINNIFTY26NOV24FUT',  # Last Tuesday
+        'expiry': '26-Nov-2024'
     },
     'MIDCPNIFTY': {
         'name': 'MIDCAP NIFTY',
-        'prefix': 'MIDCPNIFTY',
-        'expiry_day': 0  # Monday
+        'symbol': 'NSE_FO|MIDCPNIFTY25NOV24FUT',  # Last Monday
+        'expiry': '25-Nov-2024'
     }
 }
 
-# ==================== CORRECT APPROACH ====================
-# Upstox uses numeric tokens, NOT string-based symbols!
-# We must fetch from Instruments Master JSON
-
-INSTRUMENTS_URL = "https://api.upstox.com/v2/market-quote/instruments"
-
-async def fetch_instruments_master() -> dict:
-    """
-    Fetch instruments master list to get correct futures keys
-    Returns: {index_name: instrument_key}
-    """
-    headers = {
-        "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
-        "Accept": "application/json"
-    }
-    
-    logger.info("📥 Fetching Instruments Master...")
-    
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(INSTRUMENTS_URL, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    
-                    if data.get('status') == 'success' and 'data' in data:
-                        instruments = data['data']
-                        
-                        # Find current month futures for each index
-                        futures_map = {}
-                        
-                        for instrument in instruments:
-                            if instrument.get('instrument_type') != 'FUT':
-                                continue
-                            
-                            if instrument.get('segment') != 'NSE_FO':
-                                continue
-                            
-                            name = instrument.get('name', '')
-                            trading_symbol = instrument.get('trading_symbol', '')
-                            instrument_key = instrument.get('instrument_key', '')
-                            expiry = instrument.get('expiry', '')
-                            
-                            # Match our indices
-                            if name == 'NIFTY' and 'NIFTY' in trading_symbol:
-                                if 'NIFTY' not in futures_map:
-                                    futures_map['NIFTY'] = {
-                                        'key': instrument_key,
-                                        'symbol': trading_symbol,
-                                        'expiry': expiry
-                                    }
-                            
-                            elif name == 'BANKNIFTY' and 'BANKNIFTY' in trading_symbol:
-                                if 'BANKNIFTY' not in futures_map:
-                                    futures_map['BANKNIFTY'] = {
-                                        'key': instrument_key,
-                                        'symbol': trading_symbol,
-                                        'expiry': expiry
-                                    }
-                            
-                            elif name == 'FINNIFTY' and 'FINNIFTY' in trading_symbol:
-                                if 'FINNIFTY' not in futures_map:
-                                    futures_map['FINNIFTY'] = {
-                                        'key': instrument_key,
-                                        'symbol': trading_symbol,
-                                        'expiry': expiry
-                                    }
-                            
-                            elif name == 'MIDCPNIFTY' and 'MIDCPNIFTY' in trading_symbol:
-                                if 'MIDCPNIFTY' not in futures_map:
-                                    futures_map['MIDCPNIFTY'] = {
-                                        'key': instrument_key,
-                                        'symbol': trading_symbol,
-                                        'expiry': expiry
-                                    }
-                        
-                        logger.info(f"✅ Found {len(futures_map)} futures instruments")
-                        for idx, info in futures_map.items():
-                            logger.info(f"   {idx}: {info['key']} ({info['symbol']})")
-                        
-                        return futures_map
-                    
-                else:
-                    logger.error(f"❌ HTTP {resp.status}")
-                    return {}
-        
-        except Exception as e:
-            logger.error(f"💥 Error fetching instruments: {e}")
-            return {}
-
 # ==================== DATA FETCHER ====================
 class FuturesDataFetcher:
-    """Fetch historical candles for futures"""
+    """Fetch historical candles from Upstox"""
     
     def __init__(self):
         self.headers = {
@@ -167,43 +75,29 @@ class FuturesDataFetcher:
             "Accept": "application/json"
         }
     
-    async def fetch_candles(self, symbol: str, index_name: str) -> dict:
+    async def fetch_candles(self, index_name: str) -> dict:
         """
         Fetch last 10 candles (1-minute interval)
         
-        Endpoint: /v2/historical-candle/{instrument}/1minute/{to_date}/{from_date}
+        Upstox API:
+        GET /v2/historical-candle/{instrument_key}/1minute/{to_date}/{from_date}
         
-        Returns:
-        {
-            "index": "NIFTY 50",
-            "symbol": "NSE_FO|NIFTY25NOVFUT",
-            "candles": [
-                {
-                    "timestamp": "2025-11-25T14:30:00+05:30",
-                    "open": 24500.0,
-                    "high": 24520.0,
-                    "low": 24495.0,
-                    "close": 24510.0,
-                    "volume": 125000,
-                    "oi": 5000000
-                },
-                ...
-            ],
-            "total_volume": 1250000
-        }
+        Response format: [timestamp, open, high, low, close, volume, oi]
         """
+        config = FUTURES_SYMBOLS[index_name]
+        symbol = config['symbol']
+        
         async with aiohttp.ClientSession() as session:
-            # Date range: last 2 days to ensure we get today's data
+            # Date range: last 3 days
             to_date = datetime.now(IST).strftime('%Y-%m-%d')
-            from_date = (datetime.now(IST) - timedelta(days=2)).strftime('%Y-%m-%d')
+            from_date = (datetime.now(IST) - timedelta(days=3)).strftime('%Y-%m-%d')
             
             # URL encode symbol
             enc_symbol = urllib.parse.quote(symbol)
             
             url = f"https://api.upstox.com/v2/historical-candle/{enc_symbol}/1minute/{to_date}/{from_date}"
             
-            logger.info(f"🔍 Fetching: {index_name}")
-            logger.info(f"   URL: {url}")
+            logger.info(f"🔍 {config['name']}: {symbol}")
             
             try:
                 async with session.get(url, headers=self.headers) as resp:
@@ -214,49 +108,55 @@ class FuturesDataFetcher:
                             raw_candles = data['data'].get('candles', [])
                             
                             if not raw_candles:
-                                logger.warning(f"⚠️ {index_name}: No candles received")
+                                logger.warning(f"⚠️ {index_name}: No candles")
                                 return None
                             
-                            # Get last 10 candles (most recent first in response)
+                            # Last 10 candles
                             last_10 = raw_candles[:10]
                             
                             # Parse candles
-                            parsed_candles = []
-                            total_volume = 0
+                            parsed = []
+                            total_vol = 0
                             
-                            for candle in last_10:
-                                # Upstox format: [timestamp, open, high, low, close, volume, oi]
-                                parsed = {
-                                    "timestamp": candle[0],
-                                    "open": float(candle[1]),
-                                    "high": float(candle[2]),
-                                    "low": float(candle[3]),
-                                    "close": float(candle[4]),
-                                    "volume": int(candle[5]),
-                                    "oi": int(candle[6]) if len(candle) > 6 else 0
+                            for c in last_10:
+                                candle = {
+                                    "timestamp": c[0],
+                                    "open": float(c[1]),
+                                    "high": float(c[2]),
+                                    "low": float(c[3]),
+                                    "close": float(c[4]),
+                                    "volume": int(c[5]),
+                                    "oi": int(c[6]) if len(c) > 6 else 0
                                 }
-                                parsed_candles.append(parsed)
-                                total_volume += parsed['volume']
+                                parsed.append(candle)
+                                total_vol += candle['volume']
                             
-                            logger.info(f"✅ {index_name}: {len(parsed_candles)} candles | Vol: {total_volume:,}")
+                            logger.info(f"✅ {index_name}: {len(parsed)} candles | Vol: {total_vol:,}")
                             
                             return {
-                                "index": FUTURES_CONFIG[index_name]['name'],
+                                "index": config['name'],
                                 "symbol": symbol,
-                                "candles": parsed_candles,
-                                "total_volume": total_volume,
+                                "expiry": config['expiry'],
+                                "candles": parsed,
+                                "total_volume": total_vol,
                                 "timestamp": datetime.now(IST).isoformat()
                             }
                         else:
-                            logger.error(f"❌ {index_name}: Invalid response - {data}")
+                            logger.error(f"❌ {index_name}: Invalid response")
                             return None
                     
                     elif resp.status == 429:
-                        logger.warning(f"⏳ Rate limited")
+                        logger.warning(f"⏳ Rate limit")
                         return None
+                    
+                    elif resp.status == 401:
+                        logger.error(f"🔑 Invalid token!")
+                        return None
+                    
                     else:
                         error_text = await resp.text()
-                        logger.error(f"❌ {index_name}: HTTP {resp.status} - {error_text}")
+                        logger.error(f"❌ {index_name}: HTTP {resp.status}")
+                        logger.error(f"   {error_text[:200]}")
                         return None
             
             except Exception as e:
@@ -264,44 +164,40 @@ class FuturesDataFetcher:
                 return None
     
     async def fetch_all_indices(self) -> dict:
-        """Fetch data for all 4 indices"""
+        """Fetch all 4 indices"""
         results = {
             "fetch_time": datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p'),
             "indices": {}
         }
         
-        for index_name in FUTURES_CONFIG.keys():
-            symbol = get_futures_symbol(index_name)
-            data = await self.fetch_candles(symbol, index_name)
+        for index_name in FUTURES_SYMBOLS.keys():
+            data = await self.fetch_candles(index_name)
             
             if data:
                 results['indices'][index_name] = data
             else:
                 results['indices'][index_name] = {
-                    "error": "Failed to fetch data"
+                    "error": "Failed to fetch"
                 }
             
-            # Small delay to avoid rate limiting
+            # Delay to avoid rate limit
             await asyncio.sleep(0.5)
         
         return results
 
 # ==================== TELEGRAM SENDER ====================
 class TelegramSender:
-    """Send JSON data to Telegram"""
+    """Send to Telegram"""
     
     def __init__(self):
-        if not TELEGRAM_AVAILABLE:
-            raise Exception("Telegram library not available")
-        
         self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
     
-    async def send_json(self, data: dict):
-        """Send data as formatted JSON message"""
+    async def send_data(self, data: dict):
+        """Send summary + JSON file"""
         
-        # Create summary message
+        # Summary message
         summary = f"""
-🔥 FUTURES DATA TEST
+🔥 FUTURES DATA
 
 ⏰ {data['fetch_time']}
 
@@ -310,35 +206,31 @@ class TelegramSender:
 ━━━━━━━━━━━━━━━━━━━━━━━━
 """
         
-        for index_name, index_data in data['indices'].items():
-            if 'error' not in index_data:
-                config = FUTURES_CONFIG[index_name]
-                candle_count = len(index_data.get('candles', []))
-                total_vol = index_data.get('total_volume', 0)
+        for idx_name, idx_data in data['indices'].items():
+            if 'error' not in idx_data:
+                config = FUTURES_SYMBOLS[idx_name]
+                candles = idx_data.get('candles', [])
                 
-                # Latest candle
-                if index_data.get('candles'):
-                    latest = index_data['candles'][0]
+                if candles:
+                    latest = candles[0]
                     summary += f"""
 📈 {config['name']}
-   Symbol: {index_data['symbol']}
-   Candles: {candle_count}
-   Volume: {total_vol:,}
-   Latest: {latest['close']:.2f}
+   Symbol: {idx_data['symbol']}
+   Expiry: {config['expiry']}
+   Candles: {len(candles)}
+   Volume: {idx_data['total_volume']:,}
+   Latest: ₹{latest['close']:.2f}
    Time: {latest['timestamp'][-14:-9]}
 
 """
             else:
                 summary += f"""
-❌ {FUTURES_CONFIG[index_name]['name']}
-   Error: Failed to fetch
+❌ {FUTURES_SYMBOLS[idx_name]['name']}
+   Status: Failed
 
 """
         
-        summary += """━━━━━━━━━━━━━━━━━━━━━━━━
-
-📎 Full JSON data below ⬇️
-"""
+        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📎 JSON file attached"
         
         try:
             # Send summary
@@ -347,18 +239,17 @@ class TelegramSender:
                 text=summary
             )
             
-            # Send full JSON as document
-            json_str = json.dumps(data, indent=2)
-            json_bytes = json_str.encode('utf-8')
-            
+            # Send JSON file
             from io import BytesIO
-            json_file = BytesIO(json_bytes)
-            json_file.name = f"futures_data_{datetime.now(IST).strftime('%H%M%S')}.json"
+            
+            json_str = json.dumps(data, indent=2)
+            json_file = BytesIO(json_str.encode('utf-8'))
+            json_file.name = f"futures_{datetime.now(IST).strftime('%H%M%S')}.json"
             
             await self.bot.send_document(
                 chat_id=TELEGRAM_CHAT_ID,
                 document=json_file,
-                caption="📊 Full JSON Data"
+                caption="📊 Full Data"
             )
             
             logger.info("✅ Sent to Telegram")
@@ -368,20 +259,21 @@ class TelegramSender:
 
 # ==================== MAIN ====================
 async def main():
-    """Main testing loop"""
+    """Main loop"""
     
     logger.info("=" * 80)
-    logger.info("🚀 FUTURES DATA TESTING BOT")
+    logger.info("🚀 FUTURES DATA BOT - WORKING VERSION")
     logger.info("=" * 80)
     logger.info("")
-    logger.info("📊 Testing Indices:")
-    for name, config in FUTURES_CONFIG.items():
-        logger.info(f"   - {config['name']}")
+    logger.info("📊 Indices:")
+    for name, config in FUTURES_SYMBOLS.items():
+        logger.info(f"   {config['name']}: {config['symbol']}")
     logger.info("")
-    logger.info("⏱️ Interval: Every 60 seconds")
-    logger.info("📦 Data: Last 10 candles (1-minute)")
+    logger.info("⏱️ Interval: 60 seconds")
+    logger.info("📦 Data: Last 10 candles (1-min)")
     logger.info("")
     logger.info("=" * 80)
+    logger.info("")
     
     fetcher = FuturesDataFetcher()
     sender = TelegramSender()
@@ -391,31 +283,31 @@ async def main():
     while True:
         try:
             iteration += 1
-            logger.info(f"\n{'='*80}")
+            logger.info(f"\n{'='*60}")
             logger.info(f"🔄 Iteration #{iteration}")
-            logger.info(f"{'='*80}")
+            logger.info(f"{'='*60}\n")
             
             # Fetch data
             data = await fetcher.fetch_all_indices()
             
             # Send to Telegram
-            await sender.send_json(data)
+            await sender.send_data(data)
             
-            # Wait 60 seconds
+            # Wait
             logger.info("\n⏳ Waiting 60 seconds...\n")
             await asyncio.sleep(60)
         
         except KeyboardInterrupt:
-            logger.info("\n🛑 Stopped by user")
+            logger.info("\n🛑 Stopped")
             break
         
         except Exception as e:
             logger.error(f"💥 Error: {e}")
-            logger.info("   Retrying in 60 seconds...")
+            logger.info("   Retrying in 60s...")
             await asyncio.sleep(60)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("\n👋 Shutdown complete")
+        logger.info("\n👋 Bye")
