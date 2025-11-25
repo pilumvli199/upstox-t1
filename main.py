@@ -196,8 +196,16 @@ class FuturesDataFetcher:
         info = self.instruments_map[index_name]
         instrument_key = info['instrument_key']
         
+        # Check market hours
+        now = datetime.now(IST)
+        market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        
+        is_market_hours = market_open <= now <= market_close
+        is_weekday = now.weekday() < 5  # Mon-Fri
+        
         async with aiohttp.ClientSession() as session:
-            # Date range: last 3 days
+            # Date range: last 3 days (to ensure we get data)
             to_date = datetime.now(IST).strftime('%Y-%m-%d')
             from_date = (datetime.now(IST) - timedelta(days=3)).strftime('%Y-%m-%d')
             
@@ -207,6 +215,12 @@ class FuturesDataFetcher:
             url = f"https://api.upstox.com/v2/historical-candle/{enc_key}/1minute/{to_date}/{from_date}"
             
             logger.info(f"🔍 {index_name}: {instrument_key}")
+            
+            # Market status
+            if is_market_hours and is_weekday:
+                logger.info(f"   📊 Market: OPEN (Live data expected)")
+            else:
+                logger.info(f"   ⏸️ Market: CLOSED (Showing last available data)")
             
             try:
                 async with session.get(url, headers=self.headers) as resp:
@@ -227,7 +241,17 @@ class FuturesDataFetcher:
                             parsed = []
                             total_vol = 0
                             
+                            # Check if we have today's data
+                            today_str = now.strftime('%Y-%m-%d')
+                            has_today_data = False
+                            
                             for c in last_10:
+                                # Parse timestamp
+                                candle_time = datetime.fromisoformat(c[0])
+                                
+                                if candle_time.strftime('%Y-%m-%d') == today_str:
+                                    has_today_data = True
+                                
                                 candle = {
                                     "timestamp": c[0],
                                     "open": float(c[1]),
@@ -240,7 +264,12 @@ class FuturesDataFetcher:
                                 parsed.append(candle)
                                 total_vol += candle['volume']
                             
-                            logger.info(f"✅ {index_name}: {len(parsed)} candles | Vol: {total_vol:,}")
+                            # Status message
+                            if has_today_data:
+                                logger.info(f"✅ {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | TODAY'S DATA ✓")
+                            else:
+                                latest_time = datetime.fromisoformat(parsed[0]['timestamp'])
+                                logger.info(f"⚠️ {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | Last: {latest_time.strftime('%d-%b %I:%M %p')}")
                             
                             return {
                                 "index": index_name,
@@ -249,6 +278,8 @@ class FuturesDataFetcher:
                                 "expiry": info['expiry'],
                                 "candles": parsed,
                                 "total_volume": total_vol,
+                                "has_today_data": has_today_data,
+                                "market_status": "OPEN" if (is_market_hours and is_weekday) else "CLOSED",
                                 "timestamp": datetime.now(IST).isoformat()
                             }
                         else:
@@ -305,8 +336,18 @@ class TelegramSender:
     async def send_data(self, data: dict):
         """Send summary + JSON file"""
         
+        # Check if any index has today's data
+        has_live_data = any(
+            idx.get('has_today_data', False) 
+            for idx in data['indices'].values() 
+            if 'error' not in idx
+        )
+        
+        market_emoji = "🟢" if has_live_data else "🔴"
+        status_text = "LIVE DATA" if has_live_data else "LAST AVAILABLE DATA"
+        
         summary = f"""
-🔥 FUTURES DATA
+{market_emoji} FUTURES DATA - {status_text}
 
 ⏰ {data['fetch_time']}
 
@@ -321,14 +362,20 @@ class TelegramSender:
                 
                 if candles:
                     latest = candles[0]
+                    latest_time = datetime.fromisoformat(latest['timestamp'])
+                    
+                    # Data age indicator
+                    data_emoji = "🟢" if idx_data.get('has_today_data', False) else "🟡"
+                    
                     summary += f"""
-📈 {idx_name}
+{data_emoji} {idx_name}
    Symbol: {idx_data['trading_symbol']}
    Expiry: {idx_data['expiry']}
+   Market: {idx_data.get('market_status', 'UNKNOWN')}
    Candles: {len(candles)}
    Volume: {idx_data['total_volume']:,}
    Latest: ₹{latest['close']:.2f}
-   Time: {latest['timestamp'][-14:-9]}
+   Time: {latest_time.strftime('%d-%b %I:%M %p')}
 
 """
             else:
@@ -338,7 +385,14 @@ class TelegramSender:
 
 """
         
-        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n📎 JSON attached"
+        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        if not has_live_data:
+            summary += "⚠️ Market closed - showing last available data\n"
+            summary += "   Live data available during market hours:\n"
+            summary += "   Mon-Fri, 9:15 AM - 3:30 PM IST\n\n"
+        
+        summary += "📎 JSON attached"
         
         try:
             # Send summary
