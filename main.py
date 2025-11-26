@@ -544,29 +544,47 @@ class StrikeDataFeed:
             strike_data = {}
             total_options_volume = 0
             
-            # 1. SPOT PRICE
+            # 1. SPOT PRICE (FIXED - 3 Methods)
             logger.info(f"🔍 {self.index_config['name']}: Fetching Spot...")
+            
+            # Method 1: Full Market Quote (Most Reliable)
             enc_spot = urllib.parse.quote(self.index_config['spot'], safe='')
-            ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_spot}"
+            quote_url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={enc_spot}"
             
-            ltp_data = await self.fetch_with_retry(ltp_url, session)
+            quote_data = await self.fetch_with_retry(quote_url, session)
             
-            if ltp_data and ltp_data.get('status') == 'success':
-                data = ltp_data.get('data', {})
+            if quote_data and quote_data.get('status') == 'success':
+                data = quote_data.get('data', {})
                 spot_symbol = self.index_config['spot']
                 
                 if spot_symbol in data:
                     spot_info = data[spot_symbol]
-                    spot_price = spot_info.get('last_price', 0)
+                    # Try multiple price fields
+                    spot_price = (spot_info.get('last_price') or 
+                                 spot_info.get('ohlc', {}).get('close') or 
+                                 spot_info.get('ohlc', {}).get('open', 0))
                     
                     if spot_price > 0:
-                        logger.info(f"✅ Spot: ₹{spot_price:.2f}")
+                        logger.info(f"✅ Spot (Method 1): ₹{spot_price:.2f}")
             
+            # Method 2: LTP API (Fallback)
             if spot_price == 0:
-                logger.error("❌ Spot fetch failed")
-                return df, strike_data, "", 0, 0, 0
+                logger.warning("⚠️ Trying Method 2: LTP API")
+                ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_spot}"
+                ltp_data = await self.fetch_with_retry(ltp_url, session)
+                
+                if ltp_data and ltp_data.get('status') == 'success':
+                    data = ltp_data.get('data', {})
+                    spot_symbol = self.index_config['spot']
+                    
+                    if spot_symbol in data:
+                        spot_info = data[spot_symbol]
+                        spot_price = spot_info.get('last_price', 0)
+                        
+                        if spot_price > 0:
+                            logger.info(f"✅ Spot (Method 2): ₹{spot_price:.2f}")
             
-            # 2. FUTURES
+            # 2. FUTURES (Also fetch early for Method 3 fallback)
             logger.info(f"🔍 Fetching Futures: {self.futures_symbol}")
             enc_futures = urllib.parse.quote(self.futures_symbol, safe='')
             to_date = datetime.now(IST).strftime('%Y-%m-%d')
@@ -590,6 +608,17 @@ class StrikeDataFeed:
                     if not df.empty:
                         futures_price = df['close'].iloc[-1]
                         logger.info(f"✅ Futures: {len(df)} candles | ₹{futures_price:.2f}")
+            
+            # Method 3: Use Futures as Spot (Last Resort)
+            if spot_price == 0 and futures_price > 0:
+                logger.warning("⚠️ Method 3: Using Futures price as Spot")
+                spot_price = futures_price
+                logger.info(f"✅ Spot (Method 3 - Futures): ₹{spot_price:.2f}")
+            
+            # Final check
+            if spot_price == 0:
+                logger.error("❌ All spot fetch methods failed!")
+                return df, strike_data, "", 0, 0, 0
             
             # 3. OPTION CHAIN
             logger.info("🔍 Fetching Option Chain...")
