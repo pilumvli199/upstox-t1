@@ -1,28 +1,12 @@
 #!/usr/bin/env python3
 """
-STRIKE MASTER V13.0 PRO - INSTITUTIONAL GRADE OPTIONS SYSTEM
-=============================================================
-Enhanced Analysis + Live Trade Tracking + 4 Indices
+STRIKE MASTER V13.2 PRO - CORRECT EXPIRY LOGIC
+================================================
+✅ Uses CORRECT Upstox API: /v2/option/expiries
+✅ 2-Level Fallback System
+✅ Works for all 4 indices
 
-NEW FEATURES:
-✅ PHASE 1: Advanced Analysis
-   - Multi-timeframe OI confirmation (5m + 15m)
-   - Order Flow Imbalance detection
-   - Max Pain calculation
-   - Gamma squeeze zones
-   - Smart money tracking
-
-✅ PHASE 2: Live Trade Tracking
-   - 1-min position updates via Telegram
-   - Auto trailing stop loss
-   - Partial profit booking (50% at 1:1)
-   - Dynamic target extension
-   - Smart exit logic
-
-✅ All 4 Indices Active (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY)
-
-Author: Data Monster Team
-Version: 13.0 PRO - Production Ready
+Version: 13.2 - Expiry Logic Fixed
 """
 
 import os
@@ -37,7 +21,6 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, List
 import pandas as pd
 import numpy as np
-from calendar import monthrange
 from collections import defaultdict
 
 # Optional dependencies
@@ -74,46 +57,42 @@ INDICES = {
     'NIFTY': {
         'spot': "NSE_INDEX|Nifty 50",
         'name': 'NIFTY 50',
-        'expiry_day': 1,  # Tuesday
-        'expiry_type': 'weekly',  # FIXED
+        'instrument_key': 'NSE_INDEX|Nifty 50',
         'strike_gap': 50
     },
     'BANKNIFTY': {
         'spot': "NSE_INDEX|Nifty Bank",
         'name': 'BANK NIFTY',
-        'expiry_day': 2,  # Wednesday
-        'expiry_type': 'weekly',  # FIXED
+        'instrument_key': 'NSE_INDEX|Nifty Bank',
         'strike_gap': 100
     },
     'FINNIFTY': {
         'spot': "NSE_INDEX|Nifty Fin Service",
         'name': 'FIN NIFTY',
-        'expiry_day': 1,  # Tuesday
-        'expiry_type': 'weekly',  # FIXED
+        'instrument_key': 'NSE_INDEX|Nifty Fin Service',
         'strike_gap': 50
     },
     'MIDCPNIFTY': {
         'spot': "NSE_INDEX|NIFTY MID SELECT",
         'name': 'MIDCAP NIFTY',
-        'expiry_day': 1,  # Tuesday (Last of month)
-        'expiry_type': 'monthly',  # Correct
+        'instrument_key': 'NSE_INDEX|NIFTY MID SELECT',
         'strike_gap': 25
     }
 }
 
-# Active indices (all 4 enabled)
+# Active indices
 ACTIVE_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
 
 # Trading Configuration
 ALERT_ONLY_MODE = True
 SCAN_INTERVAL = 60
-TRACKING_INTERVAL = 60  # 1-min updates for active trades
+TRACKING_INTERVAL = 60
 
 # Enhanced Thresholds
 OI_THRESHOLD_STRONG = 8.0
 OI_THRESHOLD_MEDIUM = 5.0
 ATM_OI_THRESHOLD = 5.0
-ORDER_FLOW_IMBALANCE = 2.0  # NEW: CE/PE volume ratio
+ORDER_FLOW_IMBALANCE = 2.0
 VOL_SPIKE_2X = 2.0
 PCR_BULLISH = 1.08
 PCR_BEARISH = 0.92
@@ -128,9 +107,9 @@ AVOID_CLOSING = (time(15, 15), time(15, 30))
 ATR_PERIOD = 14
 ATR_SL_MULTIPLIER = 1.5
 ATR_TARGET_MULTIPLIER = 2.5
-PARTIAL_BOOK_RATIO = 0.5  # Book 50% at 1:1
-TRAIL_ACTIVATION = 0.6  # Trail after 60% to target
-TRAIL_STEP = 10  # Trail by 10 points
+PARTIAL_BOOK_RATIO = 0.5
+TRAIL_ACTIVATION = 0.6
+TRAIL_STEP = 10
 
 @dataclass
 class Signal:
@@ -153,7 +132,6 @@ class Signal:
     atr: float
     timestamp: datetime
     index_name: str
-    # NEW: Enhanced metrics
     order_flow_imbalance: float = 0.0
     max_pain_distance: float = 0.0
     gamma_zone: bool = False
@@ -183,120 +161,229 @@ class ActiveTrade:
         self.elapsed_minutes = int((datetime.now(IST) - self.entry_time).total_seconds() / 60)
         self.last_update = datetime.now(IST)
 
+# ==================== CORRECT EXPIRY MANAGER ====================
+class ExpiryManager:
+    """
+    🔥 CORRECT EXPIRY LOGIC
+    - Uses /v2/option/expiries API
+    - 2-Level Fallback System
+    """
+    
+    def __init__(self, index_name: str):
+        self.index_name = index_name
+        self.index_config = INDICES[index_name]
+        self.headers = {
+            "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+            "Accept": "application/json"
+        }
+        self.cached_expiry = None
+        self.cached_futures_symbol = None
+        self.cache_time = None
+        self.cache_duration = timedelta(hours=6)
+    
+    async def get_nearest_expiry(self) -> Tuple[str, str]:
+        """
+        Download ALL expiries using CORRECT Upstox API
+        Returns: (expiry_date_str, futures_symbol)
+        """
+        now = datetime.now(IST)
+        
+        # Return cache if valid
+        if self.cached_expiry and self.cache_time:
+            if now - self.cache_time < self.cache_duration:
+                logger.info(f"📦 Using cached expiry: {self.cached_expiry}")
+                return self.cached_expiry, self.cached_futures_symbol
+        
+        logger.info(f"🔍 Fetching expiries for {self.index_config['name']}...")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                instrument_key = self.index_config['instrument_key']
+                encoded_key = urllib.parse.quote(instrument_key, safe='')
+                
+                # ✅ CORRECT API - Get All Expiries
+                url = f"https://api.upstox.com/v2/option/expiries?instrument_key={encoded_key}"
+                
+                async with session.get(url, headers=self.headers, timeout=15) as resp:
+                    if resp.status != 200:
+                        logger.error(f"❌ Expiry fetch failed: {resp.status}")
+                        return await self._fallback_to_option_contracts()
+                    
+                    data = await resp.json()
+                    
+                    if data.get('status') != 'success':
+                        logger.error(f"❌ API error: {data}")
+                        return await self._fallback_to_option_contracts()
+                    
+                    # ✅ CORRECT: data is array of date strings
+                    expiry_dates_str = data.get('data', [])
+                    
+                    if not expiry_dates_str:
+                        logger.error("❌ No expiries in response")
+                        return await self._fallback_to_option_contracts()
+                    
+                    # Parse dates
+                    expiry_dates = []
+                    for date_str in expiry_dates_str:
+                        try:
+                            expiry_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+                            expiry_dates.append(expiry_date)
+                        except:
+                            continue
+                    
+                    if not expiry_dates:
+                        logger.error("❌ No valid expiries parsed")
+                        return await self._fallback_to_option_contracts()
+                    
+                    # Sort expiries
+                    expiry_dates.sort()
+                    
+                    # Find nearest UPCOMING expiry
+                    today = now.date()
+                    cutoff_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+                    
+                    nearest_expiry = None
+                    
+                    for expiry_date in expiry_dates:
+                        if expiry_date == today:
+                            if now < cutoff_time:
+                                nearest_expiry = expiry_date
+                                break
+                        elif expiry_date > today:
+                            nearest_expiry = expiry_date
+                            break
+                    
+                    if not nearest_expiry:
+                        logger.error("❌ No upcoming expiry found")
+                        return await self._fallback_to_option_contracts()
+                    
+                    # Generate futures symbol
+                    futures_symbol = self._generate_futures_symbol(nearest_expiry)
+                    
+                    # Cache results
+                    self.cached_expiry = nearest_expiry.strftime('%Y-%m-%d')
+                    self.cached_futures_symbol = futures_symbol
+                    self.cache_time = now
+                    
+                    logger.info(f"✅ Nearest Expiry: {self.cached_expiry}")
+                    logger.info(f"✅ Futures: {futures_symbol}")
+                    
+                    return self.cached_expiry, futures_symbol
+        
+        except Exception as e:
+            logger.error(f"💥 Expiry fetch error: {e}")
+            return await self._fallback_to_option_contracts()
+    
+    async def _fallback_to_option_contracts(self) -> Tuple[str, str]:
+        """
+        Fallback Level 1: Use /v2/option/contract API
+        """
+        logger.warning("⚠️ Fallback Level 1: Using option contracts API")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                instrument_key = self.index_config['instrument_key']
+                encoded_key = urllib.parse.quote(instrument_key, safe='')
+                
+                # Get ALL option contracts
+                url = f"https://api.upstox.com/v2/option/contract?instrument_key={encoded_key}"
+                
+                async with session.get(url, headers=self.headers, timeout=15) as resp:
+                    if resp.status != 200:
+                        return self._manual_calculation()
+                    
+                    data = await resp.json()
+                    
+                    if data.get('status') != 'success':
+                        return self._manual_calculation()
+                    
+                    contracts = data.get('data', [])
+                    
+                    # Extract unique expiry dates
+                    expiry_set = set()
+                    for contract in contracts:
+                        expiry_str = contract.get('expiry')
+                        if expiry_str:
+                            expiry_set.add(expiry_str)
+                    
+                    if not expiry_set:
+                        return self._manual_calculation()
+                    
+                    expiry_dates = sorted([
+                        datetime.strptime(d, '%Y-%m-%d').date() 
+                        for d in expiry_set
+                    ])
+                    
+                    # Find nearest
+                    now = datetime.now(IST)
+                    today = now.date()
+                    cutoff_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
+                    
+                    nearest_expiry = None
+                    for expiry_date in expiry_dates:
+                        if expiry_date == today:
+                            if now < cutoff_time:
+                                nearest_expiry = expiry_date
+                                break
+                        elif expiry_date > today:
+                            nearest_expiry = expiry_date
+                            break
+                    
+                    if not nearest_expiry:
+                        return self._manual_calculation()
+                    
+                    futures_symbol = self._generate_futures_symbol(nearest_expiry)
+                    
+                    self.cached_expiry = nearest_expiry.strftime('%Y-%m-%d')
+                    self.cached_futures_symbol = futures_symbol
+                    self.cache_time = datetime.now(IST)
+                    
+                    logger.info(f"✅ Fallback Level 1 Success: {self.cached_expiry}")
+                    
+                    return self.cached_expiry, futures_symbol
+        
+        except Exception as e:
+            logger.error(f"💥 Fallback Level 1 failed: {e}")
+            return self._manual_calculation()
+    
+    def _manual_calculation(self) -> Tuple[str, str]:
+        """Fallback Level 2: Manual calculation"""
+        logger.warning("⚠️ Fallback Level 2: Manual calculation")
+        
+        if self.cached_expiry and self.cached_futures_symbol:
+            logger.warning("⚠️ Using last cached expiry")
+            return self.cached_expiry, self.cached_futures_symbol
+        
+        now = datetime.now(IST)
+        
+        # Find next Thursday (most common expiry)
+        days_ahead = (3 - now.weekday()) % 7
+        if days_ahead == 0 and now.time() > time(15, 30):
+            days_ahead = 7
+        
+        expiry_date = (now + timedelta(days=days_ahead)).date()
+        futures_symbol = self._generate_futures_symbol(expiry_date)
+        
+        logger.warning(f"⚠️ Manual expiry: {expiry_date.strftime('%Y-%m-%d')}")
+        
+        return expiry_date.strftime('%Y-%m-%d'), futures_symbol
+    
+    def _generate_futures_symbol(self, expiry_date) -> str:
+        """Generate futures symbol from expiry date"""
+        year_short = expiry_date.year % 100
+        month_name = expiry_date.strftime('%b').upper()
+        
+        prefix_map = {
+            'NIFTY': 'NIFTY',
+            'BANKNIFTY': 'BANKNIFTY',
+            'FINNIFTY': 'FINNIFTY',
+            'MIDCPNIFTY': 'MIDCPNIFTY'
+        }
+        prefix = prefix_map.get(self.index_name, 'NIFTY')
+        
+        return f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
+
 # ==================== UTILITIES ====================
-def get_current_futures_symbol(index_name: str) -> str:
-    """Auto-detect futures symbol with expiry validation"""
-    now = datetime.now(IST)
-    year = now.year
-    month = now.month
-    
-    config = INDICES[index_name]
-    expiry_day_of_week = config['expiry_day']
-    expiry_type = config.get('expiry_type', 'weekly')
-    
-    # Calculate current month expiry
-    last_day = monthrange(year, month)[1]
-    last_date = datetime(year, month, last_day, tzinfo=IST)
-    days_back = (last_date.weekday() - expiry_day_of_week) % 7
-    expiry_date = last_date - timedelta(days=days_back)
-    
-    # If weekly, get nearest upcoming weekly expiry
-    if expiry_type == 'weekly':
-        # Find next occurrence of expiry day
-        days_until = (expiry_day_of_week - now.weekday() + 7) % 7
-        if days_until == 0:
-            days_until = 7  # Next week if today is expiry day
-        expiry_date = now + timedelta(days=days_until)
-    
-    # Check if expiry has passed (today after 3:30 PM or future date)
-    expiry_cutoff = expiry_date.replace(hour=15, minute=30, second=0, microsecond=0)
-    
-    if now >= expiry_cutoff:
-        logger.info(f"⚠️ {index_name} expiry passed, using next expiry")
-        
-        if expiry_type == 'weekly':
-            # Next week
-            expiry_date = expiry_date + timedelta(days=7)
-        else:
-            # Next month
-            if month == 12:
-                year += 1
-                month = 1
-            else:
-                month += 1
-            
-            last_day = monthrange(year, month)[1]
-            last_date = datetime(year, month, last_day, tzinfo=IST)
-            days_back = (last_date.weekday() - expiry_day_of_week) % 7
-            expiry_date = last_date - timedelta(days=days_back)
-    
-    year = expiry_date.year
-    month = expiry_date.month
-    year_short = year % 100
-    month_name = datetime(year, month, 1).strftime('%b').upper()
-    
-    prefix_map = {
-        'NIFTY': 'NIFTY',
-        'BANKNIFTY': 'BANKNIFTY',
-        'FINNIFTY': 'FINNIFTY',
-        'MIDCPNIFTY': 'MIDCPNIFTY'
-    }
-    prefix = prefix_map.get(index_name, 'NIFTY')
-    
-    symbol = f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
-    
-    expiry_str = expiry_date.strftime('%d-%b-%Y')
-    logger.info(f"🎯 {config['name']}: {symbol} (Expiry: {expiry_str})")
-    return symbol
-
-def get_expiry_date(index_name: str) -> str:
-    """Get next expiry - FIXED for weekly/monthly"""
-    now = datetime.now(IST)
-    today = now.date()
-    
-    config = INDICES[index_name]
-    expiry_day = config['expiry_day']
-    expiry_type = config.get('expiry_type', 'weekly')
-    
-    if expiry_type == 'weekly':
-        # Weekly expiry - next occurrence of expiry_day
-        days_to_expiry = (expiry_day - today.weekday() + 7) % 7
-        
-        if days_to_expiry == 0 and now.time() > time(15, 30):
-            expiry = today + timedelta(days=7)
-        else:
-            expiry = today + timedelta(days=days_to_expiry if days_to_expiry > 0 else 7)
-    
-    else:  # monthly
-        # Last occurrence of expiry_day in current month
-        year = now.year
-        month = now.month
-        last_day = monthrange(year, month)[1]
-        last_date = datetime(year, month, last_day).date()
-        
-        # Find last expiry_day of month
-        days_back = (last_date.weekday() - expiry_day) % 7
-        last_expiry_day = last_date - timedelta(days=days_back)
-        
-        # If already passed, get next month
-        if today > last_expiry_day or (today == last_expiry_day and now.time() > time(15, 30)):
-            if month == 12:
-                year += 1
-                month = 1
-            else:
-                month += 1
-            
-            last_day = monthrange(year, month)[1]
-            last_date = datetime(year, month, last_day).date()
-            days_back = (last_date.weekday() - expiry_day) % 7
-            expiry = last_date - timedelta(days=days_back)
-        else:
-            expiry = last_expiry_day
-    
-    expiry_str = expiry.strftime('%Y-%m-%d')
-    logger.info(f"📅 {index_name} Expiry: {expiry_str} ({expiry_type})")
-    return expiry_str
-
 def is_tradeable_time() -> bool:
     """Check trading window"""
     now = datetime.now(IST).time()
@@ -409,7 +496,7 @@ class RedisBrain:
 
 # ==================== DATA FEED ====================
 class StrikeDataFeed:
-    """Enhanced data fetching"""
+    """Enhanced data fetching with CORRECT expiry logic"""
     
     def __init__(self, index_name: str):
         self.index_name = index_name
@@ -418,7 +505,14 @@ class StrikeDataFeed:
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.futures_symbol = get_current_futures_symbol(index_name)
+        self.expiry_manager = ExpiryManager(index_name)
+        self.expiry_date = None
+        self.futures_symbol = None
+    
+    async def initialize(self):
+        """Initialize expiry data"""
+        self.expiry_date, self.futures_symbol = await self.expiry_manager.get_nearest_expiry()
+        logger.info(f"🎯 {self.index_config['name']}: {self.futures_symbol} (Exp: {self.expiry_date})")
     
     async def fetch_with_retry(self, url: str, session: aiohttp.ClientSession):
         """Retry logic"""
@@ -437,7 +531,12 @@ class StrikeDataFeed:
     
     async def get_market_data(self) -> Tuple[pd.DataFrame, Dict[int, dict], 
                                             str, float, float, float]:
-        """Fetch all data - FIXED SPOT EXTRACTION"""
+        """Fetch all data with CORRECT expiry"""
+        
+        # Refresh expiry if needed
+        if not self.expiry_date or not self.futures_symbol:
+            await self.initialize()
+        
         async with aiohttp.ClientSession() as session:
             spot_price = 0
             futures_price = 0
@@ -445,7 +544,7 @@ class StrikeDataFeed:
             strike_data = {}
             total_options_volume = 0
             
-            # 1. SPOT PRICE (FIXED EXTRACTION)
+            # 1. SPOT PRICE
             logger.info(f"🔍 {self.index_config['name']}: Fetching Spot...")
             enc_spot = urllib.parse.quote(self.index_config['spot'], safe='')
             ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_spot}"
@@ -456,18 +555,12 @@ class StrikeDataFeed:
                 data = ltp_data.get('data', {})
                 spot_symbol = self.index_config['spot']
                 
-                # CORRECT EXTRACTION: Get nested dict first
                 if spot_symbol in data:
-                    spot_info = data[spot_symbol]  # Get nested object
-                    spot_price = spot_info.get('last_price', 0)  # Extract price
+                    spot_info = data[spot_symbol]
+                    spot_price = spot_info.get('last_price', 0)
                     
                     if spot_price > 0:
                         logger.info(f"✅ Spot: ₹{spot_price:.2f}")
-                    else:
-                        logger.error(f"❌ Price not found in: {spot_info}")
-                else:
-                    logger.error(f"❌ Symbol '{spot_symbol}' not in response")
-                    logger.error(f"   Keys: {list(data.keys())}")
             
             if spot_price == 0:
                 logger.error("❌ Spot fetch failed")
@@ -500,8 +593,7 @@ class StrikeDataFeed:
             
             # 3. OPTION CHAIN
             logger.info("🔍 Fetching Option Chain...")
-            expiry = get_expiry_date(self.index_name)
-            chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_spot}&expiry_date={expiry}"
+            chain_url = f"https://api.upstox.com/v2/option/chain?instrument_key={enc_spot}&expiry_date={self.expiry_date}"
             
             strike_gap = self.index_config['strike_gap']
             atm_strike = round(spot_price / strike_gap) * strike_gap
@@ -532,11 +624,11 @@ class StrikeDataFeed:
                 
                 logger.info(f"✅ Collected {len(strike_data)} strikes")
             
-            return df, strike_data, expiry, spot_price, futures_price, total_options_volume
+            return df, strike_data, self.expiry_date, spot_price, futures_price, total_options_volume
 
 # ==================== ENHANCED ANALYZER ====================
 class EnhancedAnalyzer:
-    """PHASE 1: Advanced Analysis Engine"""
+    """Advanced Analysis Engine"""
     
     def __init__(self):
         self.volume_history = {}
@@ -622,7 +714,7 @@ class EnhancedAnalyzer:
         return total_pe / total_ce if total_ce > 0 else 1.0
     
     def calculate_order_flow_imbalance(self, strike_data: Dict[int, dict]) -> float:
-        """NEW: Order Flow Imbalance (CE vol / PE vol)"""
+        """Order Flow Imbalance"""
         ce_vol = sum(data['ce_vol'] for data in strike_data.values())
         pe_vol = sum(data['pe_vol'] for data in strike_data.values())
         
@@ -634,7 +726,7 @@ class EnhancedAnalyzer:
         return ratio
     
     def calculate_max_pain(self, strike_data: Dict[int, dict], spot_price: float) -> Tuple[int, float]:
-        """NEW: Max Pain Strike (where options expire worthless)"""
+        """Max Pain Strike"""
         max_pain_strike = 0
         min_pain_value = float('inf')
         
@@ -642,11 +734,9 @@ class EnhancedAnalyzer:
             pain = 0
             
             for strike, data in strike_data.items():
-                # Call pain
                 if test_strike < strike:
                     pain += data['ce_oi'] * (strike - test_strike)
                 
-                # Put pain
                 if test_strike > strike:
                     pain += data['pe_oi'] * (test_strike - strike)
             
@@ -660,7 +750,7 @@ class EnhancedAnalyzer:
         return max_pain_strike, distance
     
     def detect_gamma_zone(self, strike_data: Dict[int, dict], atm_strike: int) -> bool:
-        """NEW: Gamma Squeeze Zone Detection"""
+        """Gamma Squeeze Zone Detection"""
         if atm_strike not in strike_data:
             return False
         
@@ -683,7 +773,7 @@ class EnhancedAnalyzer:
     
     def check_multi_tf_confirmation(self, ce_5m: float, ce_15m: float, 
                                     pe_5m: float, pe_15m: float) -> bool:
-        """NEW: Multi-Timeframe Confirmation"""
+        """Multi-Timeframe Confirmation"""
         ce_aligned = (ce_5m < -3 and ce_15m < -5) or (ce_5m > 3 and ce_15m > 5)
         pe_aligned = (pe_5m < -3 and pe_15m < -5) or (pe_5m > 3 and pe_15m > 5)
         
@@ -724,7 +814,7 @@ class EnhancedAnalyzer:
 
 # ==================== TRADE TRACKER ====================
 class TradeTracker:
-    """PHASE 2: Live Trade Tracking System"""
+    """Live Trade Tracking System"""
     
     def __init__(self, telegram: Optional[Bot]):
         self.active_trades: Dict[str, ActiveTrade] = {}
@@ -756,7 +846,7 @@ class TradeTracker:
         logger.info(f"📌 Tracking: {trade_id}")
     
     async def update_trades(self, index_name: str, current_price: float):
-        """Update all active trades - 1 min tracking"""
+        """Update all active trades"""
         for trade_id, trade in list(self.active_trades.items()):
             if trade.signal.index_name != index_name:
                 continue
@@ -782,7 +872,7 @@ class TradeTracker:
                 if current_price >= trade.current_sl:
                     exit_reason = "🛑 STOP LOSS HIT"
             
-            # 3. Partial booking (50% at 1:1)
+            # 3. Partial booking
             if not trade.partial_booked:
                 progress = abs(trade.pnl_points) / abs(trade.signal.target_points)
                 if progress >= PARTIAL_BOOK_RATIO:
@@ -807,17 +897,16 @@ class TradeTracker:
                 await self.send_exit_alert(trade, exit_reason)
                 del self.active_trades[trade_id]
             else:
-                # Send 1-min update
                 await self.send_update_alert(trade)
     
     def calculate_trailing_sl(self, trade: ActiveTrade, current_price: float) -> float:
         """Calculate trailing stop loss"""
         if trade.signal.type == "CE_BUY":
             new_sl = current_price - TRAIL_STEP
-            return max(new_sl, trade.current_sl)  # Only move up
+            return max(new_sl, trade.current_sl)
         else:
             new_sl = current_price + TRAIL_STEP
-            return min(new_sl, trade.current_sl)  # Only move down
+            return min(new_sl, trade.current_sl)
     
     async def send_update_alert(self, trade: ActiveTrade):
         """Send 1-min position update"""
@@ -828,7 +917,6 @@ class TradeTracker:
         emoji = "🟢" if s.type == "CE_BUY" else "🔴"
         
         progress = (abs(trade.pnl_points) / abs(s.target_points)) * 100
-        
         sl_buffer = abs(trade.current_price - trade.current_sl)
         
         msg = f"""
@@ -919,7 +1007,7 @@ Position Closed ✅
 
 # ==================== MAIN BOT ====================
 class StrikeMasterPro:
-    """V13.0 PRO Bot with Enhanced Analysis + Live Tracking"""
+    """V13.2 PRO Bot with CORRECT Expiry Logic"""
     
     def __init__(self, index_name: str):
         self.index_name = index_name
@@ -939,6 +1027,10 @@ class StrikeMasterPro:
                 logger.info("✅ Telegram + Tracker Ready")
             except Exception as e:
                 logger.warning(f"⚠️ Telegram: {e}")
+    
+    async def initialize(self):
+        """Initialize feed with expiry data"""
+        await self.feed.initialize()
     
     async def run_cycle(self):
         """Analysis cycle"""
@@ -963,7 +1055,7 @@ class StrikeMasterPro:
         has_vol_spike, vol_mult = self.analyzer.check_volume_surge(self.index_name, vol)
         vwap_distance = abs(futures - vwap)
         
-        # PHASE 1: Enhanced Analysis
+        # Enhanced Analysis
         order_flow = self.analyzer.calculate_order_flow_imbalance(strike_data)
         max_pain_strike, max_pain_dist = self.analyzer.calculate_max_pain(strike_data, spot)
         
@@ -996,7 +1088,7 @@ class StrikeMasterPro:
         logger.info(f"📊 VWAP: {vwap:.2f} | PCR: {pcr:.2f} | Candle: {candle_color}")
         logger.info(f"📉 OI 15m: CE={ce_total_15m:+.1f}% | PE={pe_total_15m:+.1f}%")
         
-        # Generate signal with enhanced metrics
+        # Generate signal
         signal = self.generate_signal(
             spot, futures, vwap, vwap_distance, pcr, atr,
             ce_total_15m, pe_total_15m, ce_total_5m, pe_total_5m,
@@ -1009,13 +1101,12 @@ class StrikeMasterPro:
         if signal:
             await self.send_alert(signal)
             
-            # PHASE 2: Start tracking
             if self.tracker:
                 self.tracker.add_trade(signal)
         else:
             logger.info("✋ No setup")
         
-        # PHASE 2: Update active trades
+        # Update active trades
         if self.tracker and self.tracker.active_trades:
             await self.tracker.update_trades(self.index_name, spot)
         
@@ -1026,7 +1117,7 @@ class StrikeMasterPro:
                        atm_ce_change, atm_pe_change, candle_color, candle_size,
                        has_vol_spike, vol_mult, df,
                        order_flow, max_pain_dist, gamma_zone, multi_tf) -> Optional[Signal]:
-        """Enhanced signal generation with Phase 1 metrics"""
+        """Enhanced signal generation"""
         
         strike_gap = self.index_config['strike_gap']
         strike = round(spot_price / strike_gap) * strike_gap
@@ -1034,7 +1125,7 @@ class StrikeMasterPro:
         stop_loss_points = int(atr * ATR_SL_MULTIPLIER)
         target_points = int(atr * ATR_TARGET_MULTIPLIER)
         
-        # Dynamic targets based on strength
+        # Dynamic targets
         if abs(ce_total_15m) >= OI_THRESHOLD_STRONG or abs(atm_ce_change) >= OI_THRESHOLD_STRONG:
             target_points = max(target_points, 80)
         elif abs(ce_total_15m) >= OI_THRESHOLD_MEDIUM or abs(atm_ce_change) >= OI_THRESHOLD_MEDIUM:
@@ -1056,8 +1147,7 @@ class StrikeMasterPro:
                 "Bullish PCR": pcr > PCR_BULLISH,
                 "Vol Spike": has_vol_spike,
                 "Momentum": self.analyzer.check_momentum(df, 'bullish'),
-                # PHASE 1: Enhanced checks
-                "Order Flow Bullish": order_flow < 1.0,  # PE buying > CE buying
+                "Order Flow Bullish": order_flow < 1.0,
                 "Multi-TF Confirm": multi_tf,
                 "Gamma Zone": gamma_zone
             }
@@ -1066,9 +1156,8 @@ class StrikeMasterPro:
             bonus_passed = sum(bonus.values())
             
             if passed == 4:
-                # Higher confidence with Phase 1 metrics
                 confidence = 75 + (bonus_passed * 3)
-                logger.info(f"🎯 CE SIGNAL! Conf: {confidence}% (Enhanced)")
+                logger.info(f"🎯 CE SIGNAL! Conf: {confidence}%")
                 
                 return Signal(
                     type="CE_BUY",
@@ -1114,8 +1203,7 @@ class StrikeMasterPro:
                 "Bearish PCR": pcr < PCR_BEARISH,
                 "Vol Spike": has_vol_spike,
                 "Momentum": self.analyzer.check_momentum(df, 'bearish'),
-                # PHASE 1: Enhanced checks
-                "Order Flow Bearish": order_flow > 1.0,  # CE buying > PE buying
+                "Order Flow Bearish": order_flow > 1.0,
                 "Multi-TF Confirm": multi_tf,
                 "Gamma Zone": gamma_zone
             }
@@ -1125,7 +1213,7 @@ class StrikeMasterPro:
             
             if passed == 4:
                 confidence = 75 + (bonus_passed * 3)
-                logger.info(f"🎯 PE SIGNAL! Conf: {confidence}% (Enhanced)")
+                logger.info(f"🎯 PE SIGNAL! Conf: {confidence}%")
                 
                 return Signal(
                     type="PE_BUY",
@@ -1155,7 +1243,7 @@ class StrikeMasterPro:
         return None
     
     async def send_alert(self, s: Signal):
-        """Enhanced alert with Phase 1 metrics"""
+        """Enhanced alert"""
         if self.last_alert_time:
             elapsed = (datetime.now(IST) - self.last_alert_time).seconds
             if elapsed < self.alert_cooldown:
@@ -1179,7 +1267,7 @@ class StrikeMasterPro:
         timestamp_str = s.timestamp.strftime('%d-%b %I:%M %p')
         
         msg = f"""
-{emoji} {self.index_config['name']} V13.0 PRO
+{emoji} {self.index_config['name']} V13.2 PRO
 
 {mode}
 
@@ -1235,6 +1323,7 @@ ENHANCED METRICS
 
 ⏰ {timestamp_str}
 
+✅ FIXED: Correct Expiry API
 ✅ Phase 1: Enhanced Analysis
 ✅ Phase 2: Live Tracking Active
 """
@@ -1255,7 +1344,7 @@ ENHANCED METRICS
         mode = "🧪 ALERT ONLY" if ALERT_ONLY_MODE else "⚡ LIVE TRADING"
         
         msg = f"""
-🚀 STRIKE MASTER V13.0 PRO
+🚀 STRIKE MASTER V13.2 PRO
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
 STATUS
@@ -1266,16 +1355,25 @@ STATUS
 🔄 {mode}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-NEW FEATURES
+✅ FIXED IN V13.2
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
-✅ PHASE 1: Enhanced Analysis
+🔥 CORRECT Expiry API
+   • Uses /v2/option/expiries
+   • 2-Level Fallback System
+   • Works for all 4 indices
+
+━━━━━━━━━━━━━━━━━━━━━━━━
+FEATURES
+━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Phase 1: Enhanced Analysis
    • Multi-timeframe confirmation
    • Order flow imbalance
    • Max pain calculation
    • Gamma zone detection
 
-✅ PHASE 2: Live Tracking
+✅ Phase 2: Live Tracking
    • 1-min position updates
    • Auto trailing SL
    • Partial booking (50% @ 1:1)
@@ -1286,6 +1384,7 @@ CONFIG
 ━━━━━━━━━━━━━━━━━━━━━━━━
 
 📈 Futures: {self.feed.futures_symbol}
+📅 Expiry: {self.feed.expiry_date}
 🎯 Strikes: 5 (ATM ± 2)
 📏 Stops: ATR-based + Trailing
 
@@ -1304,7 +1403,7 @@ CONFIG
 
 # ==================== MAIN ====================
 async def main():
-    """Main entry - All 4 indices active"""
+    """Main entry - All 4 indices with CORRECT expiry detection"""
     
     # Validate indices
     active_indices = [idx for idx in ACTIVE_INDICES if idx in INDICES]
@@ -1318,6 +1417,7 @@ async def main():
     for index_name in active_indices:
         try:
             bot = StrikeMasterPro(index_name)
+            await bot.initialize()
             bots[index_name] = bot
             logger.info(f"✅ {INDICES[index_name]['name']}")
         except Exception as e:
@@ -1328,24 +1428,24 @@ async def main():
         return
     
     logger.info("=" * 80)
-    logger.info(f"🚀 STRIKE MASTER V13.0 PRO")
+    logger.info(f"🚀 STRIKE MASTER V13.2 PRO - CORRECT EXPIRY LOGIC")
     logger.info("=" * 80)
     logger.info("")
     logger.info(f"📊 ACTIVE INDICES ({len(bots)}):")
     for idx, bot in bots.items():
         logger.info(f"   • {INDICES[idx]['name']}")
         logger.info(f"     {bot.feed.futures_symbol}")
+        logger.info(f"     Expiry: {bot.feed.expiry_date}")
     logger.info("")
     logger.info(f"🔔 Mode: {'ALERT ONLY' if ALERT_ONLY_MODE else 'LIVE TRADING'}")
     logger.info(f"⏱️ Scan: Every {SCAN_INTERVAL}s")
     logger.info(f"📊 Tracking: Every {TRACKING_INTERVAL}s")
     logger.info("")
-    logger.info("🔥 V13.0 FEATURES:")
-    logger.info("   ✅ Enhanced Analysis (Phase 1)")
-    logger.info("   ✅ Live Trade Tracking (Phase 2)")
-    logger.info("   ✅ Auto Trailing SL")
-    logger.info("   ✅ Partial Booking")
-    logger.info("   ✅ 4 Indices Active")
+    logger.info("🔥 V13.2 FIXES:")
+    logger.info("   ✅ CORRECT API: /v2/option/expiries")
+    logger.info("   ✅ 2-Level Fallback System")
+    logger.info("   ✅ Works for ALL 4 Indices")
+    logger.info("   ✅ Enhanced Analysis + Live Tracking")
     logger.info("")
     logger.info("=" * 80)
     
