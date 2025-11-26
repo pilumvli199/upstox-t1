@@ -74,25 +74,29 @@ INDICES = {
     'NIFTY': {
         'spot': "NSE_INDEX|Nifty 50",
         'name': 'NIFTY 50',
-        'expiry_day': 1,
+        'expiry_day': 1,  # Tuesday
+        'expiry_type': 'weekly',  # FIXED
         'strike_gap': 50
     },
     'BANKNIFTY': {
         'spot': "NSE_INDEX|Nifty Bank",
         'name': 'BANK NIFTY',
-        'expiry_day': 2,
+        'expiry_day': 2,  # Wednesday
+        'expiry_type': 'weekly',  # FIXED
         'strike_gap': 100
     },
     'FINNIFTY': {
         'spot': "NSE_INDEX|Nifty Fin Service",
         'name': 'FIN NIFTY',
-        'expiry_day': 1,
+        'expiry_day': 1,  # Tuesday
+        'expiry_type': 'weekly',  # FIXED
         'strike_gap': 50
     },
     'MIDCPNIFTY': {
         'spot': "NSE_INDEX|NIFTY MID SELECT",
         'name': 'MIDCAP NIFTY',
-        'expiry_day': 0,
+        'expiry_day': 1,  # Tuesday (Last of month)
+        'expiry_type': 'monthly',  # Correct
         'strike_gap': 25
     }
 }
@@ -217,19 +221,52 @@ def get_current_futures_symbol(index_name: str) -> str:
     return f"NSE_FO|{prefix}{year_short:02d}{month_name}FUT"
 
 def get_expiry_date(index_name: str) -> str:
-    """Get next expiry"""
+    """Get next expiry - FIXED for weekly/monthly"""
     now = datetime.now(IST)
     today = now.date()
     
-    expiry_day = INDICES[index_name]['expiry_day']
-    days_to_expiry = (expiry_day - today.weekday() + 7) % 7
+    config = INDICES[index_name]
+    expiry_day = config['expiry_day']
+    expiry_type = config.get('expiry_type', 'weekly')
     
-    if days_to_expiry == 0 and now.time() > time(15, 30):
-        expiry = today + timedelta(days=7)
-    else:
-        expiry = today + timedelta(days=days_to_expiry if days_to_expiry > 0 else 7)
+    if expiry_type == 'weekly':
+        # Weekly expiry - next occurrence of expiry_day
+        days_to_expiry = (expiry_day - today.weekday() + 7) % 7
+        
+        if days_to_expiry == 0 and now.time() > time(15, 30):
+            expiry = today + timedelta(days=7)
+        else:
+            expiry = today + timedelta(days=days_to_expiry if days_to_expiry > 0 else 7)
     
-    return expiry.strftime('%Y-%m-%d')
+    else:  # monthly
+        # Last occurrence of expiry_day in current month
+        year = now.year
+        month = now.month
+        last_day = monthrange(year, month)[1]
+        last_date = datetime(year, month, last_day).date()
+        
+        # Find last expiry_day of month
+        days_back = (last_date.weekday() - expiry_day) % 7
+        last_expiry_day = last_date - timedelta(days=days_back)
+        
+        # If already passed, get next month
+        if today > last_expiry_day or (today == last_expiry_day and now.time() > time(15, 30)):
+            if month == 12:
+                year += 1
+                month = 1
+            else:
+                month += 1
+            
+            last_day = monthrange(year, month)[1]
+            last_date = datetime(year, month, last_day).date()
+            days_back = (last_date.weekday() - expiry_day) % 7
+            expiry = last_date - timedelta(days=days_back)
+        else:
+            expiry = last_expiry_day
+    
+    expiry_str = expiry.strftime('%Y-%m-%d')
+    logger.info(f"📅 {index_name} Expiry: {expiry_str} ({expiry_type})")
+    return expiry_str
 
 def is_tradeable_time() -> bool:
     """Check trading window"""
