@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-FUTURES DATA BOT - INTRADAY API VERSION
-========================================
-Uses Upstox INTRADAY API for live today's data
-Fetches last 10 candles for 4 indices
-Sends to Telegram every 60 seconds
+NIFTY50 WEEKLY FUTURES BOT - INTRADAY API VERSION
+==================================================
+✅ Only NIFTY50 with Weekly Expiry (Tuesday)
+✅ Auto-detects nearest Tuesday expiry
+✅ Uses Upstox INTRADAY API for live data
+✅ Sends to Telegram every 60 seconds
 """
 
 import os
@@ -32,7 +33,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger("FuturesBot")
+logger = logging.getLogger("NiftyWeeklyBot")
 
 # API Credentials
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN', 'YOUR_TOKEN_HERE')
@@ -42,16 +43,47 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 # Upstox Instruments JSON URL
 INSTRUMENTS_JSON_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
-# Index names to search
-INDEX_NAMES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
+# ==================== EXPIRY CALCULATOR ====================
+def get_next_tuesday_expiry(from_date=None):
+    """
+    Calculate next Tuesday expiry for NIFTY50 weekly
+    
+    NIFTY50 Weekly Expiry Rules:
+    - Expires every Tuesday
+    - If Tuesday is holiday, then previous trading day
+    """
+    if from_date is None:
+        from_date = datetime.now(IST)
+    
+    # Find next Tuesday
+    days_until_tuesday = (1 - from_date.weekday()) % 7  # Tuesday = 1
+    
+    if days_until_tuesday == 0:
+        # Today is Tuesday
+        # Check if after market hours (3:30 PM)
+        market_close = from_date.replace(hour=15, minute=30, second=0, microsecond=0)
+        if from_date > market_close:
+            # Look for next Tuesday
+            next_tuesday = from_date + timedelta(days=7)
+        else:
+            # Current Tuesday expiry
+            next_tuesday = from_date
+    else:
+        # Next Tuesday
+        next_tuesday = from_date + timedelta(days=days_until_tuesday)
+    
+    # Set to end of day (expiry time)
+    expiry_datetime = next_tuesday.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    return expiry_datetime
 
 # ==================== INSTRUMENTS FETCHER ====================
-class InstrumentsFetcher:
-    """Download and parse Upstox instruments JSON"""
+class NiftyWeeklyFetcher:
+    """Download and find NIFTY50 weekly futures"""
     
     def __init__(self):
         self.instruments = []
-        self.futures_map = {}
+        self.nifty_weekly = None
     
     async def download_instruments(self):
         """Download Upstox instruments JSON file (gzipped)"""
@@ -73,58 +105,73 @@ class InstrumentsFetcher:
                 logger.error(f"💥 Download failed: {e}")
                 return False
     
-    def find_current_month_futures(self):
-        """Find current month futures for our indices"""
-        logger.info("🔍 Finding current month futures...")
+    def find_nifty_weekly_future(self):
+        """
+        Find NIFTY50 weekly futures with nearest Tuesday expiry
         
-        now = datetime.now(IST)
+        Logic:
+        1. Calculate next Tuesday expiry
+        2. Search for NIFTY futures expiring on that date
+        3. Filter FUT type only (not options)
+        """
+        logger.info("🔍 Finding NIFTY50 weekly futures...")
+        
+        # Calculate target expiry
+        target_expiry = get_next_tuesday_expiry()
+        target_date = target_expiry.date()
+        
+        logger.info(f"🎯 Target Weekly Expiry: {target_date.strftime('%d-%b-%Y')} (Tuesday)")
+        
+        # Search in instruments
+        nifty_futures = []
         
         for instrument in self.instruments:
+            # Must be NSE Futures & Options segment
             if instrument.get('segment') != 'NSE_FO':
                 continue
             
+            # Must be Futures (not options)
             if instrument.get('instrument_type') != 'FUT':
                 continue
             
+            # Must be NIFTY (not BANKNIFTY, FINNIFTY, etc)
             name = instrument.get('name', '')
-            
-            if name not in INDEX_NAMES:
+            if name != 'NIFTY':
                 continue
             
+            # Check expiry date
             expiry_ms = instrument.get('expiry', 0)
             if not expiry_ms:
                 continue
             
             expiry_dt = datetime.fromtimestamp(expiry_ms / 1000, tz=IST)
+            expiry_date = expiry_dt.date()
             
-            if expiry_dt < now:
-                continue
-            
-            if name not in self.futures_map:
-                self.futures_map[name] = {
+            # Match with target Tuesday
+            if expiry_date == target_date:
+                nifty_futures.append({
                     'instrument_key': instrument.get('instrument_key'),
                     'exchange_token': instrument.get('exchange_token'),
                     'trading_symbol': instrument.get('trading_symbol'),
                     'expiry': expiry_dt.strftime('%d-%b-%Y'),
-                    'expiry_timestamp': expiry_ms
-                }
-            else:
-                if expiry_ms < self.futures_map[name]['expiry_timestamp']:
-                    self.futures_map[name] = {
-                        'instrument_key': instrument.get('instrument_key'),
-                        'exchange_token': instrument.get('exchange_token'),
-                        'trading_symbol': instrument.get('trading_symbol'),
-                        'expiry': expiry_dt.strftime('%d-%b-%Y'),
-                        'expiry_timestamp': expiry_ms
-                    }
+                    'expiry_timestamp': expiry_ms,
+                    'expiry_day': expiry_dt.strftime('%A')  # Should be Tuesday
+                })
         
-        logger.info(f"✅ Found {len(self.futures_map)} futures:")
-        for name, info in self.futures_map.items():
-            logger.info(f"   {name}: {info['instrument_key']}")
-            logger.info(f"      Symbol: {info['trading_symbol']}")
-            logger.info(f"      Expiry: {info['expiry']}")
+        if len(nifty_futures) == 0:
+            logger.error(f"❌ No NIFTY weekly futures found for {target_date}")
+            return False
         
-        return len(self.futures_map) > 0
+        # Should typically find 1 weekly future
+        # If multiple, pick the first one
+        self.nifty_weekly = nifty_futures[0]
+        
+        logger.info(f"✅ Found NIFTY Weekly Future:")
+        logger.info(f"   Symbol: {self.nifty_weekly['trading_symbol']}")
+        logger.info(f"   Expiry: {self.nifty_weekly['expiry']} ({self.nifty_weekly['expiry_day']})")
+        logger.info(f"   Key: {self.nifty_weekly['instrument_key']}")
+        
+        return True
     
     async def initialize(self):
         """Download and parse instruments"""
@@ -132,34 +179,28 @@ class InstrumentsFetcher:
         if not success:
             return False
         
-        return self.find_current_month_futures()
+        return self.find_nifty_weekly_future()
 
 # ==================== DATA FETCHER (INTRADAY API) ====================
-class FuturesDataFetcher:
-    """Fetch historical candles using INTRADAY API for live data"""
+class NiftyDataFetcher:
+    """Fetch NIFTY50 weekly futures data using INTRADAY API"""
     
-    def __init__(self, instruments_map):
+    def __init__(self, nifty_info):
         self.headers = {
             "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
             "Accept": "application/json"
         }
-        self.instruments_map = instruments_map
+        self.nifty_info = nifty_info
     
-    async def fetch_candles(self, index_name: str) -> dict:
+    async def fetch_candles(self) -> dict:
         """
         Fetch last 10 candles using INTRADAY API
         
-        🔥 KEY CHANGE: Using /v2/historical-candle/intraday/{key}/1minute
-        This returns ONLY TODAY'S candles - perfect for live data!
-        
-        Response: [timestamp, open, high, low, close, volume, oi]
+        Endpoint: /v2/historical-candle/intraday/{instrument_key}/1minute
+        Returns: Today's 1-minute candles
+        Format: [timestamp, open, high, low, close, volume, oi]
         """
-        if index_name not in self.instruments_map:
-            logger.error(f"❌ {index_name}: Not found in instruments")
-            return None
-        
-        info = self.instruments_map[index_name]
-        instrument_key = info['instrument_key']
+        instrument_key = self.nifty_info['instrument_key']
         
         # Check market hours
         now = datetime.now(IST)
@@ -173,10 +214,10 @@ class FuturesDataFetcher:
             # URL encode instrument key
             enc_key = urllib.parse.quote(instrument_key)
             
-            # 🔥 INTRADAY API - Returns ONLY today's candles!
+            # INTRADAY API - Returns ONLY today's candles
             url = f"https://api.upstox.com/v2/historical-candle/intraday/{enc_key}/1minute"
             
-            logger.info(f"🔍 {index_name}: {instrument_key}")
+            logger.info(f"🔍 NIFTY50 Weekly: {instrument_key}")
             
             # Market status
             if is_market_hours and is_weekday:
@@ -193,7 +234,7 @@ class FuturesDataFetcher:
                             raw_candles = data['data'].get('candles', [])
                             
                             if not raw_candles:
-                                logger.warning(f"⚠️ {index_name}: No candles (market not started?)")
+                                logger.warning(f"⚠️ NIFTY50: No candles (market not started?)")
                                 return None
                             
                             # Last 10 candles
@@ -202,8 +243,6 @@ class FuturesDataFetcher:
                             # Parse
                             parsed = []
                             total_vol = 0
-                            
-                            today_str = now.strftime('%Y-%m-%d')
                             
                             for c in last_10:
                                 candle = {
@@ -223,15 +262,16 @@ class FuturesDataFetcher:
                             data_age_minutes = (now - latest_time).total_seconds() / 60
                             
                             if data_age_minutes < 5:
-                                logger.info(f"🟢 {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | LIVE DATA ({data_age_minutes:.1f}m old)")
+                                logger.info(f"🟢 NIFTY50: {len(parsed)} candles | Vol: {total_vol:,} | LIVE ({data_age_minutes:.1f}m old)")
                             else:
-                                logger.info(f"🟡 {index_name}: {len(parsed)} candles | Vol: {total_vol:,} | {data_age_minutes:.0f}m old")
+                                logger.info(f"🟡 NIFTY50: {len(parsed)} candles | Vol: {total_vol:,} | {data_age_minutes:.0f}m old")
                             
                             return {
-                                "index": index_name,
+                                "index": "NIFTY50",
                                 "instrument_key": instrument_key,
-                                "trading_symbol": info['trading_symbol'],
-                                "expiry": info['expiry'],
+                                "trading_symbol": self.nifty_info['trading_symbol'],
+                                "expiry": self.nifty_info['expiry'],
+                                "expiry_day": self.nifty_info['expiry_day'],
                                 "candles": parsed,
                                 "total_volume": total_vol,
                                 "data_age_minutes": round(data_age_minutes, 1),
@@ -240,7 +280,7 @@ class FuturesDataFetcher:
                                 "timestamp": datetime.now(IST).isoformat()
                             }
                         else:
-                            logger.error(f"❌ {index_name}: Invalid response")
+                            logger.error(f"❌ NIFTY50: Invalid response")
                             return None
                     
                     elif resp.status == 401:
@@ -253,35 +293,13 @@ class FuturesDataFetcher:
                     
                     else:
                         error_text = await resp.text()
-                        logger.error(f"❌ {index_name}: HTTP {resp.status}")
+                        logger.error(f"❌ NIFTY50: HTTP {resp.status}")
                         logger.error(f"   {error_text[:200]}")
                         return None
             
             except Exception as e:
-                logger.error(f"💥 {index_name}: {e}")
+                logger.error(f"💥 NIFTY50: {e}")
                 return None
-    
-    async def fetch_all_indices(self) -> dict:
-        """Fetch all indices"""
-        results = {
-            "fetch_time": datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p'),
-            "indices": {}
-        }
-        
-        for index_name in INDEX_NAMES:
-            data = await self.fetch_candles(index_name)
-            
-            if data:
-                results['indices'][index_name] = data
-            else:
-                results['indices'][index_name] = {
-                    "error": "Failed to fetch"
-                }
-            
-            # Delay
-            await asyncio.sleep(0.5)
-        
-        return results
 
 # ==================== TELEGRAM SENDER ====================
 class TelegramSender:
@@ -293,68 +311,55 @@ class TelegramSender:
     async def send_data(self, data: dict):
         """Send summary + JSON file"""
         
-        # Check if any index has live data
-        has_live_data = any(
-            idx.get('is_live', False) 
-            for idx in data['indices'].values() 
-            if 'error' not in idx
-        )
+        if data is None:
+            await self.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text="❌ Failed to fetch NIFTY50 data"
+            )
+            return
         
-        market_emoji = "🟢" if has_live_data else "🟡"
-        status_text = "LIVE DATA" if has_live_data else "DELAYED DATA"
+        is_live = data.get('is_live', False)
+        data_age = data.get('data_age_minutes', 0)
+        
+        market_emoji = "🟢" if is_live else "🟡"
+        status_text = "LIVE DATA" if is_live else "DELAYED DATA"
+        
+        candles = data.get('candles', [])
+        latest = candles[0] if candles else None
         
         summary = f"""
-{market_emoji} FUTURES DATA - {status_text}
+{market_emoji} NIFTY50 WEEKLY FUTURES - {status_text}
 
-⏰ {data['fetch_time']}
+⏰ {datetime.now(IST).strftime('%d-%b-%Y %I:%M:%S %p')}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━
-📊 DATA SUMMARY
+📊 NIFTY50 DATA
 ━━━━━━━━━━━━━━━━━━━━━━━━
-"""
-        
-        for idx_name, idx_data in data['indices'].items():
-            if 'error' not in idx_data:
-                candles = idx_data.get('candles', [])
-                
-                if candles:
-                    latest = candles[0]
-                    latest_time = datetime.fromisoformat(latest['timestamp'])
-                    
-                    # Data freshness indicator
-                    is_live = idx_data.get('is_live', False)
-                    data_age = idx_data.get('data_age_minutes', 0)
-                    
-                    if is_live:
-                        freshness = f"🟢 Live ({data_age:.1f}m)"
-                    elif data_age < 60:
-                        freshness = f"🟡 {data_age:.0f}m ago"
-                    else:
-                        freshness = f"🔴 {data_age/60:.1f}h ago"
-                    
-                    summary += f"""
-📈 {idx_name}
-   Symbol: {idx_data['trading_symbol']}
-   Expiry: {idx_data['expiry']}
-   Status: {freshness}
-   Market: {idx_data.get('market_status', 'UNKNOWN')}
-   Candles: {len(candles)}
-   Volume: {idx_data['total_volume']:,}
-   Latest: ₹{latest['close']:.2f}
-   Time: {latest_time.strftime('%I:%M %p')}
 
-"""
-            else:
-                summary += f"""
-❌ {idx_name}
-   Status: Failed to fetch
-
+📈 Symbol: {data['trading_symbol']}
+📅 Expiry: {data['expiry']} ({data['expiry_day']})
+🕐 Status: {market_emoji} {"Live" if is_live else f"{data_age:.0f}m ago"}
+📊 Market: {data.get('market_status', 'UNKNOWN')}
+📉 Candles: {len(candles)}
+📦 Volume: {data['total_volume']:,}
 """
         
-        summary += "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        if latest:
+            latest_time = datetime.fromisoformat(latest['timestamp'])
+            summary += f"""
+💰 Latest Price: ₹{latest['close']:.2f}
+📈 Open: ₹{latest['open']:.2f}
+📊 High: ₹{latest['high']:.2f}
+📉 Low: ₹{latest['low']:.2f}
+🕐 Time: {latest_time.strftime('%I:%M %p')}
+📊 OI: {latest['oi']:,}
+"""
         
-        if not has_live_data:
-            summary += "ℹ️ Market hours: Mon-Fri, 9:15 AM - 3:30 PM IST\n\n"
+        summary += "\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        if not is_live:
+            summary += "ℹ️ Market hours: Mon-Fri, 9:15 AM - 3:30 PM IST\n"
+            summary += "ℹ️ Weekly expiry: Every Tuesday\n\n"
         
         summary += "📎 JSON attached"
         
@@ -368,12 +373,12 @@ class TelegramSender:
             # Send JSON
             json_str = json.dumps(data, indent=2)
             json_file = BytesIO(json_str.encode('utf-8'))
-            json_file.name = f"futures_{datetime.now(IST).strftime('%H%M%S')}.json"
+            json_file.name = f"nifty50_{datetime.now(IST).strftime('%H%M%S')}.json"
             
             await self.bot.send_document(
                 chat_id=TELEGRAM_CHAT_ID,
                 document=json_file,
-                caption="📊 Full Data"
+                caption="📊 Full NIFTY50 Data"
             )
             
             logger.info("✅ Sent to Telegram")
@@ -386,27 +391,24 @@ async def main():
     """Main loop"""
     
     logger.info("=" * 80)
-    logger.info("🚀 FUTURES DATA BOT - INTRADAY API VERSION")
+    logger.info("🚀 NIFTY50 WEEKLY FUTURES BOT - INTRADAY API VERSION")
     logger.info("=" * 80)
     logger.info("")
-    logger.info("🔥 Using INTRADAY API for live today's data!")
+    logger.info("📊 Only NIFTY50 with Weekly Expiry (Tuesday)")
+    logger.info("🔥 Using INTRADAY API for live today's data")
     logger.info("")
     
     # Initialize instruments
-    logger.info("📥 Loading instruments from Upstox...")
-    instruments_fetcher = InstrumentsFetcher()
+    logger.info("📥 Loading NIFTY50 weekly futures from Upstox...")
+    nifty_fetcher = NiftyWeeklyFetcher()
     
-    success = await instruments_fetcher.initialize()
+    success = await nifty_fetcher.initialize()
     if not success:
-        logger.error("❌ Failed to load instruments!")
-        return
-    
-    if len(instruments_fetcher.futures_map) == 0:
-        logger.error("❌ No futures found!")
+        logger.error("❌ Failed to find NIFTY50 weekly futures!")
         return
     
     logger.info("")
-    logger.info("✅ Instruments loaded successfully")
+    logger.info("✅ NIFTY50 weekly future loaded successfully")
     logger.info("")
     logger.info("⏱️ Interval: 60 seconds")
     logger.info("📦 Data: Last 10 candles (1-min)")
@@ -415,7 +417,7 @@ async def main():
     logger.info("")
     
     # Create fetcher and sender
-    fetcher = FuturesDataFetcher(instruments_fetcher.futures_map)
+    fetcher = NiftyDataFetcher(nifty_fetcher.nifty_weekly)
     sender = TelegramSender()
     
     iteration = 0
@@ -428,7 +430,7 @@ async def main():
             logger.info(f"{'='*60}\n")
             
             # Fetch data
-            data = await fetcher.fetch_all_indices()
+            data = await fetcher.fetch_candles()
             
             # Send to Telegram
             await sender.send_data(data)
