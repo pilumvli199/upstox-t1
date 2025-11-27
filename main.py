@@ -325,8 +325,8 @@ class NiftyDataFeed:
             logger.info("🔍 Fetching NIFTY spot...")
             enc_spot = urllib.parse.quote(NIFTY_CONFIG['spot_key'])
             
-            # Method 1: Try OHLC endpoint (most stable)
-            ohlc_url = f"https://api.upstox.com/v2/market-quote/ohlc?symbol={enc_spot}"
+            # Method 1: Try OHLC endpoint (most stable) - ✅ FIXED: interval parameter
+            ohlc_url = f"https://api.upstox.com/v2/market-quote/ohlc?instrument_key={enc_spot}&interval=1d"
             spot_data = await self.fetch_with_retry(ohlc_url, session)
             if spot_data and spot_data.get('status') == 'success':
                 data_dict = spot_data.get('data', {})
@@ -338,10 +338,10 @@ class NiftyDataFeed:
                     if spot_price > 0:
                         logger.info(f"✅ Spot (OHLC): ₹{spot_price:.2f}")
             
-            # Method 2: Fallback to quotes endpoint
+            # Method 2: Fallback to quotes endpoint - ✅ FIXED: instrument_key parameter
             if spot_price == 0:
                 logger.warning("⚠️ OHLC failed, trying quotes...")
-                quotes_url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={enc_spot}"
+                quotes_url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={enc_spot}"
                 spot_data = await self.fetch_with_retry(quotes_url, session)
                 if spot_data and spot_data.get('status') == 'success':
                     data_dict = spot_data.get('data', {})
@@ -351,10 +351,10 @@ class NiftyDataFeed:
                         if spot_price > 0:
                             logger.info(f"✅ Spot (Quotes): ₹{spot_price:.2f}")
             
-            # Method 3: Try LTP endpoint
+            # Method 3: Try LTP endpoint - ✅ FIXED: instrument_key parameter
             if spot_price == 0:
                 logger.warning("⚠️ Quotes failed, trying LTP...")
-                ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?symbol={enc_spot}"
+                ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={enc_spot}"
                 spot_data = await self.fetch_with_retry(ltp_url, session)
                 if spot_data and spot_data.get('status') == 'success':
                     data_dict = spot_data.get('data', {})
