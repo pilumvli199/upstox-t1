@@ -313,7 +313,7 @@ class NiftyDataFeed:
         return None
     
     async def get_market_data(self) -> Tuple[pd.DataFrame, Dict[int, dict], float, float, float]:
-        """✅ FIXED: Correct response parsing for spot price"""
+        """✅ BULLETPROOF: Try multiple methods to get spot price"""
         async with aiohttp.ClientSession() as session:
             spot_price = 0
             futures_price = 0
@@ -321,25 +321,48 @@ class NiftyDataFeed:
             strike_data = {}
             total_options_volume = 0
             
-            # 1. SPOT PRICE - ✅ FIXED
+            # 1. SPOT PRICE - TRY MULTIPLE METHODS
             logger.info("🔍 Fetching NIFTY spot...")
             enc_spot = urllib.parse.quote(NIFTY_CONFIG['spot_key'])
-            spot_url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={enc_spot}"
             
-            for attempt in range(3):
-                spot_data = await self.fetch_with_retry(spot_url, session)
+            # Method 1: Try OHLC endpoint (most stable)
+            ohlc_url = f"https://api.upstox.com/v2/market-quote/ohlc?symbol={enc_spot}"
+            spot_data = await self.fetch_with_retry(ohlc_url, session)
+            if spot_data and spot_data.get('status') == 'success':
+                data_dict = spot_data.get('data', {})
+                if NIFTY_CONFIG['spot_key'] in data_dict:
+                    quote_info = data_dict[NIFTY_CONFIG['spot_key']]
+                    spot_price = quote_info.get('last_price', 0)
+                    if spot_price == 0:
+                        spot_price = quote_info.get('close', 0)
+                    if spot_price > 0:
+                        logger.info(f"✅ Spot (OHLC): ₹{spot_price:.2f}")
+            
+            # Method 2: Fallback to quotes endpoint
+            if spot_price == 0:
+                logger.warning("⚠️ OHLC failed, trying quotes...")
+                quotes_url = f"https://api.upstox.com/v2/market-quote/quotes?symbol={enc_spot}"
+                spot_data = await self.fetch_with_retry(quotes_url, session)
                 if spot_data and spot_data.get('status') == 'success':
-                    # ✅ FIXED: Access nested data correctly
                     data_dict = spot_data.get('data', {})
                     if NIFTY_CONFIG['spot_key'] in data_dict:
                         quote_info = data_dict[NIFTY_CONFIG['spot_key']]
                         spot_price = quote_info.get('last_price', 0)
                         if spot_price > 0:
-                            logger.info(f"✅ Spot: ₹{spot_price:.2f}")
-                            break
-                if attempt < 2:
-                    logger.warning(f"⚠️ Spot fetch retry {attempt + 1}/3")
-                    await asyncio.sleep(2)
+                            logger.info(f"✅ Spot (Quotes): ₹{spot_price:.2f}")
+            
+            # Method 3: Try LTP endpoint
+            if spot_price == 0:
+                logger.warning("⚠️ Quotes failed, trying LTP...")
+                ltp_url = f"https://api.upstox.com/v2/market-quote/ltp?symbol={enc_spot}"
+                spot_data = await self.fetch_with_retry(ltp_url, session)
+                if spot_data and spot_data.get('status') == 'success':
+                    data_dict = spot_data.get('data', {})
+                    if NIFTY_CONFIG['spot_key'] in data_dict:
+                        quote_info = data_dict[NIFTY_CONFIG['spot_key']]
+                        spot_price = quote_info.get('last_price', 0)
+                        if spot_price > 0:
+                            logger.info(f"✅ Spot (LTP): ₹{spot_price:.2f}")
             
             # 2. FUTURES CANDLES
             logger.info(f"🔍 Fetching futures: {self.futures_symbol}")
