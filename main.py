@@ -1475,7 +1475,7 @@ class UpstoxClient:
         return mapping.get(symbol, f"NSE_EQ|{symbol}")
     
     async def _request_with_retry(self, method: str, url: str, **kwargs) -> Optional[Dict]:
-        """✅ NEW: Request with retry logic"""
+        """✅ NEW: Request with retry logic and better error logging"""
         for attempt in range(MAX_RETRIES):
             try:
                 async with getattr(self.session, method)(url, **kwargs) as response:
@@ -1486,7 +1486,12 @@ class UpstoxClient:
                         logger.warning(f"⚠️ Rate limited, waiting {wait_time}s...")
                         await asyncio.sleep(wait_time)
                     else:
-                        logger.warning(f"⚠️ Request failed: {response.status}")
+                        # ✅ Log the actual error response for debugging
+                        try:
+                            error_body = await response.text()
+                            logger.warning(f"⚠️ Request failed: {response.status} - {error_body[:200]}")
+                        except:
+                            logger.warning(f"⚠️ Request failed: {response.status}")
                         return None
             except asyncio.TimeoutError:
                 logger.warning(f"⚠️ Timeout on attempt {attempt + 1}")
@@ -1628,13 +1633,31 @@ class UpstoxClient:
         quote = await self.get_full_quote(instrument_key)
         return quote["ltp"]
     
-    async def get_historical_candles(self, instrument_key: str) -> pd.DataFrame:
+    async def get_historical_candles(self, instrument_key: str, symbol: str = None) -> pd.DataFrame:
         """
-        ✅ FIXED: Get historical candles with proper API format
+        ✅ FIXED: Get historical candles
+        - For INDEX: Use Futures instrument key (NSE_INDEX doesn't support historical API)
+        - For others: Use provided instrument key
         """
         try:
             all_candles = []
             today = datetime.now(IST).date()
+            
+            # ✅ FIX: For indices, use Futures instrument key instead of Index key
+            # NSE_INDEX instruments don't support historical candle API
+            candle_instrument_key = instrument_key
+            
+            if "NSE_INDEX" in instrument_key and symbol:
+                # Use futures key for historical data
+                if symbol in self.futures_keys:
+                    candle_instrument_key = self.futures_keys[symbol]
+                    logger.info(f"📈 Using Futures key for {symbol}: {candle_instrument_key}")
+                else:
+                    logger.warning(f"⚠️ No futures key for {symbol}, trying index key")
+            
+            # URL encode the instrument key (important for keys with | character)
+            import urllib.parse
+            encoded_key = urllib.parse.quote(candle_instrument_key, safe='')
             
             # Get historical data for previous days
             for days_back in range(1, 6):
@@ -1647,8 +1670,8 @@ class UpstoxClient:
                 to_date = historical_date.strftime('%Y-%m-%d')
                 from_date = historical_date.strftime('%Y-%m-%d')
                 
-                # ✅ FIXED: Correct V2 API format
-                url = f"{UPSTOX_API_URL}/historical-candle/{instrument_key}/5minute/{to_date}/{from_date}"
+                # ✅ FIXED: Use URL-encoded instrument key
+                url = f"{UPSTOX_API_URL}/historical-candle/{encoded_key}/5minute/{to_date}/{from_date}"
                 
                 try:
                     data = await self._request_with_retry('get', url)
@@ -1667,14 +1690,14 @@ class UpstoxClient:
                                 'oi': candle[6] if len(candle) > 6 else 0
                             })
                         
-                        logger.debug(f"✅ Historical {to_date}: {len(hist_candles)} candles")
+                        logger.info(f"✅ Historical {to_date}: {len(hist_candles)} candles")
                 except Exception as e:
                     logger.warning(f"⚠️ Historical data for {to_date} failed: {e}")
                 
                 await asyncio.sleep(API_DELAY)
             
             # Get intraday data for today
-            url_intraday = f"{UPSTOX_API_URL}/historical-candle/intraday/{instrument_key}/5minute"
+            url_intraday = f"{UPSTOX_API_URL}/historical-candle/intraday/{encoded_key}/5minute"
             
             data = await self._request_with_retry('get', url_intraday)
             
@@ -1693,9 +1716,11 @@ class UpstoxClient:
                     })
                 
                 logger.info(f"✅ Intraday: {len(intraday_candles)} candles")
+            else:
+                logger.warning(f"⚠️ No intraday data received")
             
             if not all_candles:
-                logger.warning(f"⚠️ No candles found for {instrument_key}")
+                logger.warning(f"⚠️ No candles found for {candle_instrument_key}")
                 return pd.DataFrame()
             
             df = pd.DataFrame(all_candles)
@@ -1824,8 +1849,8 @@ class OptionAnalyzer:
             
             logger.info(f"💰 {symbol} Spot: ₹{current_price:,.2f}")
             
-            # Get candles
-            candles = await self.client.get_historical_candles(instrument_key)
+            # Get candles - pass symbol to use futures key for indices
+            candles = await self.client.get_historical_candles(instrument_key, symbol)
             
             if candles.empty:
                 logger.warning(f"⚠️ No candle data for {symbol}")
