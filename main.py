@@ -1637,30 +1637,33 @@ class UpstoxClient:
         """
         ✅ FIXED: Get historical candles
         - For INDEX: Use Futures instrument key (NSE_INDEX doesn't support historical API)
-        - For others: Use provided instrument key
+        - Use 1minute interval and resample to 5minute (5minute not supported by Upstox)
         """
         try:
             all_candles = []
             today = datetime.now(IST).date()
             
             # ✅ FIX: For indices, use Futures instrument key instead of Index key
-            # NSE_INDEX instruments don't support historical candle API
             candle_instrument_key = instrument_key
             
             if "NSE_INDEX" in instrument_key and symbol:
-                # Use futures key for historical data
                 if symbol in self.futures_keys:
                     candle_instrument_key = self.futures_keys[symbol]
                     logger.info(f"📈 Using Futures key for {symbol}: {candle_instrument_key}")
                 else:
                     logger.warning(f"⚠️ No futures key for {symbol}, trying index key")
             
-            # URL encode the instrument key (important for keys with | character)
+            # URL encode the instrument key
             import urllib.parse
             encoded_key = urllib.parse.quote(candle_instrument_key, safe='')
             
+            # ✅ FIX: Use 1minute interval (5minute not supported by Upstox API)
+            # Historical API accepts: 1minute, 30minute, day, week, month
+            # Intraday API accepts: 1minute, 30minute
+            INTERVAL = "1minute"
+            
             # Get historical data for previous days
-            for days_back in range(1, 6):
+            for days_back in range(1, 4):  # Reduced to 3 days (more 1min data)
                 historical_date = today - timedelta(days=days_back)
                 
                 # Skip weekends
@@ -1670,8 +1673,7 @@ class UpstoxClient:
                 to_date = historical_date.strftime('%Y-%m-%d')
                 from_date = historical_date.strftime('%Y-%m-%d')
                 
-                # ✅ FIXED: Use URL-encoded instrument key
-                url = f"{UPSTOX_API_URL}/historical-candle/{encoded_key}/5minute/{to_date}/{from_date}"
+                url = f"{UPSTOX_API_URL}/historical-candle/{encoded_key}/{INTERVAL}/{to_date}/{from_date}"
                 
                 try:
                     data = await self._request_with_retry('get', url)
@@ -1690,14 +1692,14 @@ class UpstoxClient:
                                 'oi': candle[6] if len(candle) > 6 else 0
                             })
                         
-                        logger.info(f"✅ Historical {to_date}: {len(hist_candles)} candles")
+                        logger.info(f"✅ Historical {to_date}: {len(hist_candles)} candles (1min)")
                 except Exception as e:
                     logger.warning(f"⚠️ Historical data for {to_date} failed: {e}")
                 
                 await asyncio.sleep(API_DELAY)
             
             # Get intraday data for today
-            url_intraday = f"{UPSTOX_API_URL}/historical-candle/intraday/{encoded_key}/5minute"
+            url_intraday = f"{UPSTOX_API_URL}/historical-candle/intraday/{encoded_key}/{INTERVAL}"
             
             data = await self._request_with_retry('get', url_intraday)
             
@@ -1715,7 +1717,7 @@ class UpstoxClient:
                         'oi': candle[6] if len(candle) > 6 else 0
                     })
                 
-                logger.info(f"✅ Intraday: {len(intraday_candles)} candles")
+                logger.info(f"✅ Intraday: {len(intraday_candles)} candles (1min)")
             else:
                 logger.warning(f"⚠️ No intraday data received")
             
@@ -1723,18 +1725,31 @@ class UpstoxClient:
                 logger.warning(f"⚠️ No candles found for {candle_instrument_key}")
                 return pd.DataFrame()
             
+            # Create 1-minute DataFrame
             df = pd.DataFrame(all_candles)
             df.set_index('timestamp', inplace=True)
             df = df.sort_index()
             df = df[~df.index.duplicated(keep='last')]
             
+            logger.info(f"📊 Raw 1min candles: {len(df)}")
+            
+            # ✅ RESAMPLE 1-minute to 5-minute candles
+            df_5min = df.resample('5min').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'volume': 'sum',
+                'oi': 'last'
+            }).dropna()
+            
             # Keep last 200 candles
-            if len(df) > CANDLES_COUNT:
-                df = df.tail(CANDLES_COUNT)
+            if len(df_5min) > CANDLES_COUNT:
+                df_5min = df_5min.tail(CANDLES_COUNT)
             
-            logger.info(f"✅ Total candles loaded: {len(df)}")
+            logger.info(f"✅ Resampled to 5min: {len(df_5min)} candles")
             
-            return df
+            return df_5min
             
         except Exception as e:
             logger.error(f"❌ Error fetching candles: {e}")
