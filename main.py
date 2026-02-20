@@ -1,32 +1,35 @@
 """
-🚀 NIFTY OPTIONS BOT - PRODUCTION READY v5.1
-==============================================
-Version: 5.1 (VOLUME + PCR + ENHANCED LOGS!)
-Author: Built for Indian Options Trading
-Last Updated: Feb 2026
+🚀 NIFTY 50 OPTIONS BOT v6.1 PRO
+==================================
+Platform  : NSE via Upstox API v2
+Asset     : NIFTY 50 Weekly Options
+Lot Size  : 65
+Updated   : Feb 2026
 
-✅ NEW IN v5.1:
-- 🔥 VOLUME TRACKING (CE/PE per strike)
-- ✅ PCR (Put-Call Ratio) trend analysis
-- ✅ DETAILED LOGS before DeepSeek call
-- ✅ Triple Confirmation: OI + Volume + Candlestick
-- ✅ Volume momentum detection
-- ✅ False signal filtering (OI up but Volume down = TRAP)
+✅ v6.1 CHANGES FROM v6.0:
+- ATM_RANGE: 6 → 4  (±200 pts, focused strikes)
+- PHASE1_OI_BUILD_PCT: 4.0 → 6.0  (less false positives on NIFTY)
+- PHASE2_VOL_SPIKE_PCT: 20.0 → 15.0  (realistic threshold)
+- Overall MTF threshold: 12 → 8  (adjusted for 9 strikes)
+- Candle fetch FIX: 3 API calls → 2 (1min + 30min only, Upstox V2 supports these)
+  → 1min fetched once, Pandas resample to 5min (price action / patterns)
+  → 30min fetched directly (day trend / S/R levels)
+  → 15min was INVALID on Upstox V2 — removed
+- Expiry refresh: har 30min → fakt daily once (unnecessary API calls hotte)
+- Koyeb deployment compatible (PORT env, health endpoint)
 
-⚡ FEATURES:
-- ATM Strike: 3x weight in analysis
-- ATM ±50: 2x weight
-- ATM ±100/150: 1x weight
-- Support = Highest PUT OI strike
-- Resistance = Highest CALL OI strike
-- Volume = Momentum confirmation
-- PCR = Bull/Bear strength indicator
-
-🎯 STRATEGY:
-- Primary: OI + Volume Changes (15-min)
-- Secondary: PCR Trend + Candlestick Patterns
-- AI: DeepSeek V3 with 30-sec timeout
-- Confirmation: All 3 must align for signal
+✅ v6.0 FEATURES (unchanged):
+- ETH bot architecture (DualCache + PhaseDetector + MTFAnalyzer)
+- 5-min polling (real-time OI/Volume/PCR)
+- DUAL CACHE: 5-min x72 (6hr) + 30-min x12 (6hr)
+- MTF Analysis: 5min + 15min + 30min OI/Volume/PCR (via DualCache snapshots)
+- PHASE DETECTION: Phase1 → Phase2 → Phase3
+- Pandas/Numpy pre-calculation before AI call
+- Smart AI trigger: DeepSeek only when needed
+- Expiry auto-detection (3:30PM + holiday safe)
+- Market hours check (IST 9:15 - 3:30)
+- DeepSeek V3 (deepseek-chat)
+- NIFTY specific: Strike interval 50, Lot size 65, IV analysis
 """
 
 import asyncio
@@ -41,1553 +44,1718 @@ import json
 import logging
 import os
 import pytz
+import time as time_module
 
-# ======================== CONFIGURATION ========================
-# Environment Variables
+# ============================================================
+#  CONFIGURATION
+# ============================================================
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "YOUR_TOKEN")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "YOUR_DEEPSEEK_KEY")
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN",  "YOUR_BOT_TOKEN")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",     "YOUR_CHAT_ID")
+DEEPSEEK_API_KEY    = os.getenv("DEEPSEEK_API_KEY",     "YOUR_DEEPSEEK_KEY")
 
-# Upstox API
-UPSTOX_API_URL = "https://api.upstox.com/v2"
+UPSTOX_BASE    = "https://api.upstox.com/v2"
+INSTRUMENT_KEY = "NSE_INDEX|Nifty 50"
 
-# Trading Parameters
-SYMBOL = "NIFTY"
-ATM_RANGE = 3  # ±3 strikes (7 total)
-STRIKE_INTERVAL = 50  # NIFTY strike gap
-ANALYSIS_INTERVAL = 5 * 60  # 5 minutes
-CACHE_SIZE = 6  # 30 min = 6 snapshots @ 5min
+LOT_SIZE        = 65
+STRIKE_INTERVAL = 50
+ATM_RANGE       = 4          # v6.1: was 6 → now ±200 pts (9 strikes)
 
-# Signal Thresholds
-MIN_OI_CHANGE_15MIN = 10.0  # 10% = strong signal
-STRONG_OI_CHANGE = 15.0     # 15% = very strong
-MIN_VOLUME_CHANGE = 15.0    # 15% volume increase for confirmation
-MIN_CONFIDENCE = 7          # Only alert if confidence >= 7
+SNAPSHOT_INTERVAL = 5 * 60
+ANALYSIS_INTERVAL = 30 * 60
 
-# Strike Weight Multipliers
-ATM_WEIGHT = 3.0      # ATM strike gets 3x importance
-NEAR_ATM_WEIGHT = 2.0  # ATM ±50 gets 2x importance
-FAR_WEIGHT = 1.0       # ATM ±100/150 gets 1x importance
+CACHE_5MIN_SIZE  = 72
+CACHE_30MIN_SIZE = 12
+CANDLE_COUNT     = 24        # candles after resample (not raw 1min)
 
-# API Settings
-API_DELAY = 0.2  # 200ms between calls
-MAX_RETRIES = 3
-DEEPSEEK_TIMEOUT = 30  # 30 seconds timeout
+MIN_OI_CHANGE    = 8.0
+STRONG_OI_CHANGE = 15.0
+MIN_VOLUME_CHG   = 15.0
+PCR_BULL         = 1.2
+PCR_BEAR         = 0.8
+MIN_CONFIDENCE   = 7
 
-# Market Hours (IST)
-IST = pytz.timezone('Asia/Kolkata')
-MARKET_START_HOUR = 9
-MARKET_START_MIN = 15
-MARKET_END_HOUR = 15
-MARKET_END_MIN = 30
+PHASE1_OI_BUILD_PCT   = 6.0   # v6.1: was 4.0 → less false positives on NIFTY
+PHASE1_VOL_MAX_PCT    = 12.0
+PHASE2_VOL_SPIKE_PCT  = 15.0  # v6.1: was 20.0 → realistic for NIFTY
+PHASE2_OI_MIN_PCT     = 3.0
+PHASE3_PRICE_MOVE_PCT = 0.25
 
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+OI_ALERT_PCT  = 12.0
+VOL_SPIKE_PCT = 25.0
+PCR_ALERT_PCT = 10.0
+ATM_PROX_PTS  = 50
+
+ATM_WEIGHT      = 3.0
+NEAR_ATM_WEIGHT = 2.0
+FAR_WEIGHT      = 1.0
+
+# v6.1: adjusted for 9 strikes (ATM_RANGE=4)
+MTF_OVERALL_THRESHOLD = 8    # was 12
+
+MAX_RETRIES      = 3
+API_DELAY        = 0.3
+DEEPSEEK_TIMEOUT = 45
+
+IST = pytz.timezone("Asia/Kolkata")
+MARKET_START = (9, 15)
+MARKET_END   = (15, 30)
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ======================== DATA STRUCTURES ========================
+# ============================================================
+#  DATA STRUCTURES
+# ============================================================
+
 @dataclass
 class OISnapshot:
-    """Enhanced OI + Volume snapshot per strike"""
-    strike: int
-    ce_oi: int
-    pe_oi: int
-    ce_volume: int      # ✅ NEW
-    pe_volume: int      # ✅ NEW
-    ce_ltp: float
-    pe_ltp: float
-    pcr: float          # ✅ NEW: PE OI / CE OI
+    strike:    int
+    ce_oi:     float
+    pe_oi:     float
+    ce_volume: float
+    pe_volume: float
+    ce_ltp:    float
+    pe_ltp:    float
+    ce_iv:     float
+    pe_iv:     float
+    pcr:       float
     timestamp: datetime
 
 
 @dataclass
 class MarketSnapshot:
-    """Complete market data at a point in time"""
-    timestamp: datetime
-    spot_price: float
-    atm_strike: int
-    strikes_oi: Dict[int, OISnapshot]  # strike -> OISnapshot
-    overall_pcr: float  # ✅ NEW: Total PUT OI / Total CALL OI
+    timestamp:    datetime
+    spot_price:   float
+    atm_strike:   int
+    expiry:       str
+    strikes_oi:   Dict[int, OISnapshot]
+    overall_pcr:  float
+    total_ce_oi:  float
+    total_pe_oi:  float
+    total_ce_vol: float
+    total_pe_vol: float
+
+
+@dataclass
+class PhaseSignal:
+    phase:            int
+    dominant_side:    str
+    direction:        str
+    oi_change_pct:    float
+    vol_change_pct:   float
+    price_change_pct: float
+    atm_strike:       int
+    spot_price:       float
+    confidence:       float
+    message:          str
+
+
+@dataclass
+class TrendInfo:
+    day_trend:      str
+    intraday_trend: str
+    trend_5min:     str
+    trend_30min:    str     # v6.1: was trend_15min, now uses 30min candles
+    vwap:           float
+    spot_vs_vwap:   str
+    all_agree:      bool
+    summary:        str
+
+
+@dataclass
+class PriceActionInsight:
+    price_change_5m:   float
+    price_change_15m:  float
+    price_change_30m:  float
+    price_momentum:    str
+    vol_rolling_avg:   float
+    vol_spike_ratio:   float
+    oi_vol_corr:       float
+    price_oi_corr:     float
+    support_levels:    List[float]
+    resistance_levels: List[float]
+    trend_strength:    float
+    triple_confirmed:  bool
+    trend:             TrendInfo
 
 
 @dataclass
 class StrikeAnalysis:
-    """Detailed analysis for a single strike with Volume"""
-    strike: int
-    is_atm: bool
-    distance_from_atm: int
-    weight: float
-    
-    # Current OI + Volume
-    ce_oi: int
-    pe_oi: int
-    ce_volume: int      # ✅ NEW
-    pe_volume: int      # ✅ NEW
-    ce_ltp: float
-    pe_ltp: float
-    
-    # OI Changes
-    ce_oi_change_5min: float
-    pe_oi_change_5min: float
-    ce_oi_change_15min: float
-    pe_oi_change_15min: float
-    ce_oi_change_30min: float
-    pe_oi_change_30min: float
-    
-    # Volume Changes ✅ NEW
-    ce_vol_change_5min: float
-    pe_vol_change_5min: float
-    ce_vol_change_15min: float
-    pe_vol_change_15min: float
-    ce_vol_change_30min: float
-    pe_vol_change_30min: float
-    
-    # Ratios
-    put_call_ratio: float  # PE OI / CE OI
-    pcr_change_15min: float  # ✅ NEW
-    
-    # Writer Activity
-    ce_writer_action: str  # "BUILDING" / "UNWINDING" / "NEUTRAL"
-    pe_writer_action: str
-    
-    # Volume Confirmation ✅ NEW
-    volume_confirms_oi: bool  # Volume direction matches OI direction
-    volume_strength: str  # "STRONG" / "MODERATE" / "WEAK"
-    
-    # Support/Resistance Role
-    is_support_level: bool
-    is_resistance_level: bool
-    
-    # Signal Strength
-    bullish_signal_strength: float  # 0-10
-    bearish_signal_strength: float  # 0-10
-    
-    # Recommendation
-    strike_recommendation: str  # "STRONG_CALL" / "STRONG_PUT" / "WAIT"
-    confidence: float  # 0-10
+    strike:        int
+    is_atm:        bool
+    distance_atm:  int
+    weight:        float
+    ce_oi:         float
+    pe_oi:         float
+    ce_volume:     float
+    pe_volume:     float
+    ce_ltp:        float
+    pe_ltp:        float
+    ce_iv:         float
+    pe_iv:         float
+    ce_oi_5:       float
+    pe_oi_5:       float
+    ce_vol_5:      float
+    pe_vol_5:      float
+    ce_oi_15:      float
+    pe_oi_15:      float
+    ce_vol_15:     float
+    pe_vol_15:     float
+    pcr_ch_15:     float
+    ce_oi_30:      float
+    pe_oi_30:      float
+    ce_vol_30:     float
+    pe_vol_30:     float
+    pcr:           float
+    ce_action:     str
+    pe_action:     str
+    tf5_signal:    str
+    tf15_signal:   str
+    tf30_signal:   str
+    mtf_confirmed: bool
+    vol_confirms:  bool
+    vol_strength:  str
+    is_support:    bool
+    is_resistance: bool
+    bull_strength: float
+    bear_strength: float
+    recommendation: str
+    confidence:    float
 
 
 @dataclass
 class SupportResistance:
-    """Support/Resistance levels from OI"""
-    support_strike: int
-    support_put_oi: int
-    resistance_strike: int
-    resistance_call_oi: int
-    spot_near_support: bool  # within 50 points
-    spot_near_resistance: bool  # within 50 points
+    support_strike:     int
+    support_put_oi:     float
+    resistance_strike:  int
+    resistance_call_oi: float
+    near_support:       bool
+    near_resistance:    bool
 
 
-# ======================== IN-MEMORY CACHE ========================
-class SimpleCache:
-    """Stores last 30 min of data (6 snapshots) with Volume"""
-    
-    def __init__(self, max_size: int = CACHE_SIZE):
-        self.snapshots = deque(maxlen=max_size)
+# ============================================================
+#  DUAL CACHE
+# ============================================================
+
+class DualCache:
+    def __init__(self):
+        self._c5   = deque(maxlen=CACHE_5MIN_SIZE)
+        self._c30  = deque(maxlen=CACHE_30MIN_SIZE)
         self._lock = asyncio.Lock()
-    
-    async def add(self, snapshot: MarketSnapshot):
-        """Add new snapshot"""
+
+    async def add_5min(self, snap: MarketSnapshot):
         async with self._lock:
-            self.snapshots.append(snapshot)
-            logger.info(f"📦 Cached snapshot | Total: {len(self.snapshots)} | PCR: {snapshot.overall_pcr:.2f}")
-    
-    async def get_minutes_ago(self, minutes: int) -> Optional[MarketSnapshot]:
-        """Get snapshot from N minutes ago"""
+            self._c5.append(snap)
+        logger.info(f"📦 5min cache: {len(self._c5)}/{CACHE_5MIN_SIZE} | PCR:{snap.overall_pcr:.2f}")
+
+    async def add_30min(self, snap: MarketSnapshot):
         async with self._lock:
-            if len(self.snapshots) < 2:
-                return None
-            
-            target_time = datetime.now(IST) - timedelta(minutes=minutes)
-            
-            # Find closest match
-            best = None
-            min_diff = float('inf')
-            
-            for snap in self.snapshots:
-                diff = abs((snap.timestamp - target_time).total_seconds())
-                if diff < min_diff:
-                    min_diff = diff
-                    best = snap
-            
-            # Accept if within reasonable tolerance (3 minutes)
-            if best and min_diff <= 180:
-                return best
-            
-            return None
-    
-    def size(self) -> int:
-        return len(self.snapshots)
+            self._c30.append(snap)
+
+    async def get_5min_ago(self, n: int) -> Optional[MarketSnapshot]:
+        async with self._lock:
+            idx = len(self._c5) - 1 - n
+            return self._c5[idx] if idx >= 0 else None
+
+    async def get_30min_ago(self, n: int) -> Optional[MarketSnapshot]:
+        async with self._lock:
+            idx = len(self._c30) - 1 - n
+            return self._c30[idx] if idx >= 0 else None
+
+    async def get_recent(self, n: int) -> List[MarketSnapshot]:
+        async with self._lock:
+            lst = list(self._c5)
+            return lst[-n:] if len(lst) >= n else lst
+
+    def sizes(self) -> Tuple[int, int]:
+        return len(self._c5), len(self._c30)
+
+    def has_data(self) -> bool:
+        return len(self._c5) >= 3
 
 
-# ======================== UPSTOX CLIENT ========================
+# ============================================================
+#  UPSTOX CLIENT
+# ============================================================
+
 class UpstoxClient:
-    """Upstox v2 API client"""
-    
+    """
+    v6.1 Candle fix:
+    Upstox V2 intraday supports ONLY 1minute and 30minute.
+    5min / 15min endpoints return error on V2.
+    Solution:
+      - get_candles() → fetches 1min + 30min (2 API calls)
+      - 1min → Pandas resample → 5min (used for price action, patterns, trend)
+      - 30min → used for day trend, S/R levels
+    OI/Volume MTF (5min/15min/30min) uses DualCache snapshots — NO candle API needed.
+    """
+
     def __init__(self, token: str):
-        self.token = token
+        self.token   = token
         self.session = None
         self.headers = {
             "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
+            "Accept":        "application/json"
         }
-    
+
     async def init(self):
-        """Initialize session"""
-        if not self.session:
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(
-                headers=self.headers,
-                timeout=timeout
-            )
-    
+        self.session = aiohttp.ClientSession(
+            headers=self.headers,
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+
     async def close(self):
-        """Close session"""
         if self.session:
             await self.session.close()
-    
-    async def _request(self, method: str, url: str, **kwargs) -> Optional[Dict]:
-        """Request with retry"""
+
+    async def _get(self, url: str, params: Dict = None) -> Optional[Dict]:
         for attempt in range(MAX_RETRIES):
             try:
-                async with getattr(self.session, method)(url, **kwargs) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    elif resp.status == 429:
-                        wait = (attempt + 1) * 2
-                        logger.warning(f"⚠️ Rate limited, waiting {wait}s")
-                        await asyncio.sleep(wait)
-                    else:
-                        text = await resp.text()
-                        logger.warning(f"⚠️ Request failed: {resp.status} - {text[:200]}")
-                        return None
-            except Exception as e:
-                logger.error(f"❌ Request error: {e}")
-                if attempt == MAX_RETRIES - 1:
+                async with self.session.get(url, params=params) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    if r.status == 429:
+                        await asyncio.sleep((attempt + 1) * 3)
+                        continue
+                    txt = await r.text()
+                    logger.warning(f"⚠️ {url} {r.status}: {txt[:100]}")
                     return None
+            except aiohttp.ClientConnectorError:
+                logger.error(f"❌ Network ({attempt+1}/{MAX_RETRIES})")
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"❌ Request: {e}")
                 await asyncio.sleep(1)
         return None
-    
-    async def get_option_chain(self, expiry: str) -> Optional[Dict]:
-        """Get option chain for NIFTY with Volume data"""
-        url = f"{UPSTOX_API_URL}/option/chain"
-        params = {
-            "instrument_key": "NSE_INDEX|Nifty 50",
-            "expiry_date": expiry
-        }
-        return await self._request('get', url, params=params)
-    
-    async def get_1min_candles(self) -> pd.DataFrame:
-        """Get NIFTY 50 spot 1-min candles"""
-        instrument_key = "NSE_INDEX|Nifty 50"
-        url = f"{UPSTOX_API_URL}/historical-candle/intraday/{instrument_key}/1minute"
-        
-        logger.info(f"📈 Fetching NIFTY 50 spot candles...")
-        data = await self._request('get', url)
-        
-        if not data or data.get("status") != "success":
-            logger.warning("⚠️ Could not fetch candle data from API")
-            return pd.DataFrame()
-        
-        candles = data.get("data", {}).get("candles", [])
-        
-        if not candles or len(candles) == 0:
-            logger.warning("⚠️ Empty candle data from Upstox")
-            logger.info("💡 Continuing with OI-only analysis")
-            return pd.DataFrame()
-        
-        df_data = []
-        for candle in candles:
-            try:
-                df_data.append({
-                    'timestamp': pd.to_datetime(candle[0]),
-                    'open': float(candle[1]),
-                    'high': float(candle[2]),
-                    'low': float(candle[3]),
-                    'close': float(candle[4]),
-                    'volume': int(candle[5]) if len(candle) > 5 else 0
-                })
-            except (IndexError, ValueError) as e:
-                logger.warning(f"⚠️ Skipping malformed candle: {e}")
-                continue
-        
-        if not df_data:
-            logger.warning("⚠️ No valid candle data after parsing")
-            return pd.DataFrame()
-        
-        df = pd.DataFrame(df_data)
-        df.set_index('timestamp', inplace=True)
-        df.sort_index(inplace=True)
-        
-        logger.info(f"✅ Fetched {len(df)} 1-min NIFTY 50 spot candles")
-        return df
-    
-    async def get_available_expiries(self) -> List[str]:
-        """Get all available expiry dates from Upstox API"""
-        url = f"{UPSTOX_API_URL}/option/contract"
-        params = {"instrument_key": "NSE_INDEX|Nifty 50"}
-        
-        data = await self._request('get', url, params=params)
-        
-        if not data or data.get("status") != "success":
-            logger.warning("⚠️ Could not fetch available expiries")
-            return []
-        
-        contracts = data.get("data", [])
-        
-        if not contracts:
-            logger.warning("⚠️ No option contracts available")
-            return []
-        
-        expiries = sorted(set(item.get("expiry") for item in contracts if item.get("expiry")))
-        logger.info(f"📅 Found {len(expiries)} available expiries")
-        return expiries
-    
+
     async def get_nearest_expiry(self) -> Optional[str]:
-        """Get ACTUAL nearest expiry from Upstox"""
-        expiries = await self.get_available_expiries()
-        
-        if not expiries:
-            logger.error("❌ No expiries available from Upstox")
+        """Auto expiry — 3:30PM cutoff + holiday safe"""
+        data = await self._get(f"{UPSTOX_BASE}/option/contract",
+                               params={"instrument_key": INSTRUMENT_KEY})
+        if not data or data.get("status") != "success":
             return None
-        
-        now = datetime.now(IST).date()
-        future_expiries = [
-            exp for exp in expiries 
-            if datetime.strptime(exp, '%Y-%m-%d').date() >= now
-        ]
-        
-        if not future_expiries:
-            logger.warning("⚠️ No future expiries found, using last available")
-            return expiries[-1]
-        
-        nearest = future_expiries[0]
-        logger.info(f"✅ Using nearest expiry: {nearest}")
-        return nearest
+
+        now_ist = datetime.now(IST)
+        cutoff  = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        today   = now_ist.date()
+
+        expiry_set = sorted(set(
+            c.get("expiry") for c in data.get("data", []) if c.get("expiry")
+        ))
+
+        for exp in expiry_set:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+            if exp_date < today:
+                continue
+            if exp_date == today and now_ist >= cutoff:
+                continue
+            logger.info(f"📅 Expiry: {exp}")
+            return exp
+
+        logger.error("❌ No valid expiry")
+        return None
+
+    async def _fetch_raw_candles(self, resolution: str) -> pd.DataFrame:
+        """
+        Internal: fetch intraday candles for given resolution.
+        resolution = '1minute' or '30minute' (only these valid on Upstox V2)
+        Returns raw DataFrame with all intraday candles (no tail applied here).
+        """
+        url  = f"{UPSTOX_BASE}/historical-candle/intraday/{INSTRUMENT_KEY}/{resolution}"
+        data = await self._get(url)
+
+        if not data or data.get("status") != "success":
+            logger.warning(f"⚠️ Candle fetch failed: {resolution}")
+            return pd.DataFrame()
+
+        raw = data.get("data", {}).get("candles", [])
+        if not raw:
+            return pd.DataFrame()
+
+        rows = []
+        for c in raw:
+            try:
+                rows.append({
+                    "timestamp": pd.to_datetime(c[0]),
+                    "open":      float(c[1]),
+                    "high":      float(c[2]),
+                    "low":       float(c[3]),
+                    "close":     float(c[4]),
+                    "volume":    int(c[5]) if len(c) > 5 else 0
+                })
+            except Exception:
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).set_index("timestamp").sort_index()
+        return df
+
+    async def get_candles(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        v6.1 FIX: 2 API calls instead of 3.
+        Returns: (df_1m, df_5m, df_30m)
+          - df_1m  : last CANDLE_COUNT 1min candles (for VWAP calculation)
+          - df_5m  : 1min resampled to 5min, last CANDLE_COUNT candles
+                     → used for: price action, patterns, intraday trend
+          - df_30m : 30min candles directly from Upstox, last CANDLE_COUNT candles
+                     → used for: day trend, S/R levels
+        NOTE: OI/Volume MTF (5min/15min/30min) uses DualCache — NOT these candles.
+        """
+        # Fetch 1min (all intraday data — do NOT tail before resample)
+        df_1m_raw = await self._fetch_raw_candles("1minute")
+        await asyncio.sleep(API_DELAY)
+        # Fetch 30min directly (Upstox V2 supports this)
+        df_30m_raw = await self._fetch_raw_candles("30minute")
+
+        # 1min tail for VWAP
+        df_1m = df_1m_raw.tail(CANDLE_COUNT) if not df_1m_raw.empty else pd.DataFrame()
+
+        # Resample 1min → 5min using ALL intraday data, then tail
+        if not df_1m_raw.empty:
+            df_5m = df_1m_raw.resample("5min").agg({
+                "open": "first", "high": "max",
+                "low": "min", "close": "last", "volume": "sum"
+            }).dropna()
+            df_5m = df_5m.tail(CANDLE_COUNT)
+            logger.info(f"📊 1min→5min resample: {len(df_5m)} candles")
+        else:
+            df_5m = pd.DataFrame()
+
+        # 30min tail
+        df_30m = df_30m_raw.tail(CANDLE_COUNT) if not df_30m_raw.empty else pd.DataFrame()
+        logger.info(f"📊 30min candles: {len(df_30m)}")
+
+        return df_1m, df_5m, df_30m
+
+    async def fetch_snapshot(self, expiry: str) -> Optional[MarketSnapshot]:
+        url  = f"{UPSTOX_BASE}/option/chain"
+        data = await self._get(url, params={
+            "instrument_key": INSTRUMENT_KEY,
+            "expiry_date":    expiry
+        })
+
+        if not data or data.get("status") != "success":
+            return None
+
+        chain = data.get("data", [])
+        if not chain:
+            return None
+
+        spot = 0.0
+        for item in chain:
+            spot = float(item.get("underlying_spot_price", 0))
+            if spot > 0:
+                break
+        if spot <= 0:
+            return None
+
+        logger.info(f"💰 NIFTY: {spot:,.2f}")
+        atm   = round(spot / STRIKE_INTERVAL) * STRIKE_INTERVAL
+        min_s = atm - ATM_RANGE * STRIKE_INTERVAL   # ATM_RANGE=4 → ±200 pts
+        max_s = atm + ATM_RANGE * STRIKE_INTERVAL
+
+        strikes_oi: Dict[int, OISnapshot] = {}
+        t_ce_oi = t_pe_oi = t_ce_vol = t_pe_vol = 0.0
+
+        for item in chain:
+            strike = int(item.get("strike_price", 0))
+            if not (min_s <= strike <= max_s):
+                continue
+
+            ce = item.get("call_options", {}).get("market_data", {})
+            pe = item.get("put_options",  {}).get("market_data", {})
+            cg = item.get("call_options", {}).get("option_greeks", {})
+            pg = item.get("put_options",  {}).get("option_greeks", {})
+
+            ce_oi  = float(ce.get("oi",     0) or 0)
+            pe_oi  = float(pe.get("oi",     0) or 0)
+            ce_vol = float(ce.get("volume", 0) or 0)
+            pe_vol = float(pe.get("volume", 0) or 0)
+            ce_ltp = float(ce.get("ltp",    0) or 0)
+            pe_ltp = float(pe.get("ltp",    0) or 0)
+            ce_iv  = float(cg.get("iv",     0) or 0) * 100
+            pe_iv  = float(pg.get("iv",     0) or 0) * 100
+            pcr    = (pe_oi / ce_oi) if ce_oi > 0 else 0.0
+
+            t_ce_oi  += ce_oi;  t_pe_oi  += pe_oi
+            t_ce_vol += ce_vol; t_pe_vol += pe_vol
+
+            strikes_oi[strike] = OISnapshot(
+                strike=strike, ce_oi=ce_oi, pe_oi=pe_oi,
+                ce_volume=ce_vol, pe_volume=pe_vol,
+                ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+                ce_iv=ce_iv, pe_iv=pe_iv, pcr=pcr,
+                timestamp=datetime.now(IST)
+            )
+
+        if not strikes_oi:
+            return None
+
+        overall_pcr = (t_pe_oi / t_ce_oi) if t_ce_oi > 0 else 0.0
+        logger.info(f"✅ {len(strikes_oi)} strikes | ATM:{atm} | PCR:{overall_pcr:.2f}")
+
+        return MarketSnapshot(
+            timestamp=datetime.now(IST),
+            spot_price=spot, atm_strike=atm, expiry=expiry,
+            strikes_oi=strikes_oi, overall_pcr=overall_pcr,
+            total_ce_oi=t_ce_oi, total_pe_oi=t_pe_oi,
+            total_ce_vol=t_ce_vol, total_pe_vol=t_pe_vol
+        )
 
 
-# ======================== PATTERN DETECTOR ========================
+# ============================================================
+#  TREND CALCULATOR
+# ============================================================
+
+class TrendCalculator:
+
+    @staticmethod
+    def vwap(df: pd.DataFrame) -> float:
+        if df.empty or df["volume"].sum() == 0:
+            return 0.0
+        tp = (df["high"] + df["low"] + df["close"]) / 3
+        return float((tp * df["volume"]).sum() / df["volume"].sum())
+
+    @staticmethod
+    def trend(df: pd.DataFrame) -> str:
+        if df.empty or len(df) < 3:
+            return "SIDEWAYS"
+        c = df["close"].values
+        if c[-1] > c[-3] * 1.001:  return "UPTREND"
+        if c[-1] < c[-3] * 0.999:  return "DOWNTREND"
+        return "SIDEWAYS"
+
+    @staticmethod
+    def calculate(df_1m: pd.DataFrame, df_5m: pd.DataFrame,
+                  df_30m: pd.DataFrame, spot: float) -> TrendInfo:
+        """
+        v6.1: df_15m replaced with df_30m (Upstox V2 only supports 1min + 30min)
+        - VWAP from 1min data
+        - Intraday trend from 5min
+        - Day trend from 30min
+        """
+        vwap_val  = TrendCalculator.vwap(df_1m)
+        day_t     = TrendCalculator.trend(df_30m)   # 30min for day trend
+        intra_t   = TrendCalculator.trend(df_5m)    # 5min for intraday
+        t5        = TrendCalculator.trend(df_5m.tail(4) if len(df_5m) >= 4 else df_5m)
+        spot_vwap = "ABOVE" if vwap_val > 0 and spot > vwap_val else "BELOW"
+        tfs       = [day_t, intra_t, t5]
+        all_agree = len(set(tfs)) == 1 and tfs[0] != "SIDEWAYS"
+
+        if all(t == "UPTREND"   for t in tfs):
+            summary = f"📈 ALL UPTREND | Spot {spot_vwap} VWAP"
+        elif all(t == "DOWNTREND" for t in tfs):
+            summary = f"📉 ALL DOWNTREND | Spot {spot_vwap} VWAP"
+        else:
+            summary = f"Mixed trends | Spot {spot_vwap} VWAP ₹{vwap_val:.0f}"
+
+        return TrendInfo(day_t, intra_t, t5, day_t, vwap_val, spot_vwap, all_agree, summary)
+
+
+# ============================================================
+#  PANDAS/NUMPY PRE-CALCULATOR
+# ============================================================
+
+class PriceActionCalculator:
+
+    @staticmethod
+    def calculate(snaps: List[MarketSnapshot],
+                  df_1m: pd.DataFrame, df_5m: pd.DataFrame,
+                  df_30m: pd.DataFrame) -> PriceActionInsight:
+        """
+        v6.1: df_15m → df_30m for S/R detection + trend
+        OI/Volume changes use DualCache snapshots (not candles).
+        Price changes use snapshot spot prices.
+        """
+        if len(snaps) < 3:
+            return PriceActionCalculator._empty(df_1m, df_5m, df_30m)
+
+        prices = np.array([s.spot_price for s in snaps])
+        curr   = prices[-1]
+
+        def pct(ago: int) -> float:
+            return ((curr - prices[-(ago+1)]) / prices[-(ago+1)] * 100
+                    if len(prices) > ago else 0.0)
+
+        p5m, p15m, p30m = pct(1), pct(3), pct(6)
+        momentum = "BULLISH" if p5m > 0.2 else "BEARISH" if p5m < -0.2 else "NEUTRAL"
+
+        vols        = np.array([s.total_ce_vol + s.total_pe_vol for s in snaps])
+        vol_rolling = float(np.mean(vols[:-1])) if len(vols) > 1 else float(vols[-1])
+        vol_spike   = (float(vols[-1]) / vol_rolling) if vol_rolling > 0 else 1.0
+
+        ce_ois   = np.array([s.total_ce_oi for s in snaps])
+        pe_ois   = np.array([s.total_pe_oi for s in snaps])
+        oi_total = ce_ois + pe_ois
+
+        oi_vol_corr = float(np.corrcoef(oi_total, vols)[0, 1]) if (
+            len(oi_total) > 2 and np.std(oi_total) > 0 and np.std(vols) > 0) else 0.0
+        price_oi_corr = float(np.corrcoef(prices, oi_total)[0, 1]) if (
+            len(prices) > 2 and np.std(prices) > 0 and np.std(oi_total) > 0) else 0.0
+
+        # S/R from 30min candles (v6.1: was 15min)
+        supports, resistances = [], []
+        if not df_30m.empty and len(df_30m) >= 5:
+            df  = df_30m.tail(20)
+            lws = df["low"].values
+            hws = df["high"].values
+            for i in range(1, len(lws) - 1):
+                if lws[i] < lws[i-1] and lws[i] < lws[i+1]:
+                    supports.append(float(lws[i]))
+                if hws[i] > hws[i-1] and hws[i] > hws[i+1]:
+                    resistances.append(float(hws[i]))
+            supports    = sorted(supports,    key=lambda x: abs(x - curr))[:3]
+            resistances = sorted(resistances, key=lambda x: abs(x - curr))[:3]
+
+        trend = TrendCalculator.calculate(df_1m, df_5m, df_30m, curr)
+
+        ts = 0.0
+        if abs(p5m) >= 0.4:   ts += 3.0
+        elif abs(p5m) >= 0.2: ts += 1.5
+        if vol_spike >= 1.5:   ts += 3.0
+        elif vol_spike >= 1.2: ts += 1.5
+        oi_ch = ((oi_total[-1] - oi_total[0]) / oi_total[0] * 100) if oi_total[0] > 0 else 0
+        if abs(oi_ch) >= 10:  ts += 4.0
+        elif abs(oi_ch) >= 5: ts += 2.0
+
+        price_bull = p5m > 0.2
+        price_bear = p5m < -0.2
+        oi_bull    = len(pe_ois) > 1 and pe_ois[-1] > pe_ois[0]
+        oi_bear    = len(ce_ois) > 1 and ce_ois[-1] > ce_ois[0]
+        vol_ok     = vol_spike >= 1.2
+        triple     = (price_bull and oi_bull and vol_ok) or (price_bear and oi_bear and vol_ok)
+
+        return PriceActionInsight(
+            price_change_5m=round(p5m, 3),   price_change_15m=round(p15m, 3),
+            price_change_30m=round(p30m, 3), price_momentum=momentum,
+            vol_rolling_avg=round(vol_rolling, 0), vol_spike_ratio=round(vol_spike, 2),
+            oi_vol_corr=round(oi_vol_corr, 2), price_oi_corr=round(price_oi_corr, 2),
+            support_levels=supports, resistance_levels=resistances,
+            trend_strength=round(min(10.0, ts), 1), triple_confirmed=triple, trend=trend
+        )
+
+    @staticmethod
+    def _empty(df_1m, df_5m, df_30m) -> PriceActionInsight:
+        t = TrendInfo("SIDEWAYS","SIDEWAYS","SIDEWAYS","SIDEWAYS",0.0,"ABOVE",False,"Building...")
+        if not df_5m.empty:
+            try:
+                t = TrendCalculator.calculate(df_1m, df_5m, df_30m,
+                                              float(df_5m.iloc[-1]["close"]))
+            except Exception:
+                pass
+        return PriceActionInsight(0, 0, 0, "NEUTRAL", 0, 1.0, 0, 0, [], [], 0, False, t)
+
+
+# ============================================================
+#  MTF OI ANALYZER
+# ============================================================
+
+class MTFAnalyzer:
+    """
+    OI/Volume MTF Analysis uses DualCache snapshots exclusively.
+    5min ago  = cache[-1]
+    15min ago = cache[-3]
+    30min ago = cache[-6]
+    This is correct and does NOT depend on candle API.
+    v6.1: MTF_OVERALL_THRESHOLD = 8 (was 12, adjusted for 9 strikes with ATM_RANGE=4)
+    """
+
+    def __init__(self, cache: DualCache):
+        self.cache = cache
+
+    @staticmethod
+    def _pct(c: float, p: float) -> float:
+        return ((c - p) / p * 100) if p > 0 else 0.0
+
+    @staticmethod
+    def _action(ch: float) -> str:
+        if ch >= 8:  return "BUILDING"
+        if ch <= -8: return "UNWINDING"
+        return "NEUTRAL"
+
+    @staticmethod
+    def _tf_signal(ce: float, pe: float, cv: float, pv: float) -> str:
+        if pe >= MIN_OI_CHANGE and pv >= MIN_VOLUME_CHG: return "BULLISH"
+        if ce >= MIN_OI_CHANGE and cv >= MIN_VOLUME_CHG: return "BEARISH"
+        if pe <= -MIN_OI_CHANGE: return "BEARISH"
+        if ce <= -MIN_OI_CHANGE: return "BULLISH"
+        return "NEUTRAL"
+
+    @staticmethod
+    def _vol_confirm(oi_ch: float, vol_ch: float) -> Tuple[bool, str]:
+        if oi_ch > 8  and vol_ch > MIN_VOLUME_CHG: return True,  "STRONG"
+        if oi_ch > 4  and vol_ch > 10:             return True,  "MODERATE"
+        if abs(oi_ch) < 4 and abs(vol_ch) < 4:    return True,  "WEAK"
+        return False, "WEAK"
+
+    def _strength(self, ce30: float, pe30: float, cv30: float, pv30: float,
+                  weight: float, mtf: bool) -> Tuple[float, float]:
+        bull = bear = 0.0
+        boost = 1.5 if mtf else 0.8
+        if   pe30 >= STRONG_OI_CHANGE: bull = 9.0
+        elif pe30 >= MIN_OI_CHANGE:    bull = 7.0
+        elif pe30 >= 5:                bull = 4.0
+        if   ce30 >= STRONG_OI_CHANGE: bear = 9.0
+        elif ce30 >= MIN_OI_CHANGE:    bear = 7.0
+        elif ce30 >= 5:                bear = 4.0
+        if pe30 <= -STRONG_OI_CHANGE:  bear = max(bear, 8.0)
+        elif pe30 <= -MIN_OI_CHANGE:   bear = max(bear, 6.0)
+        if ce30 <= -STRONG_OI_CHANGE:  bull = max(bull, 8.0)
+        elif ce30 <= -MIN_OI_CHANGE:   bull = max(bull, 6.0)
+        return min(10.0, bull * weight * boost), min(10.0, bear * weight * boost)
+
+    async def analyze(self, current: MarketSnapshot) -> Dict:
+        # DualCache snapshot comparisons
+        s5  = await self.cache.get_5min_ago(1)   # 5min ago
+        s15 = await self.cache.get_5min_ago(3)   # 15min ago
+        s30 = await self.cache.get_5min_ago(6)   # 30min ago
+
+        if not s5:
+            return {"available": False, "reason": "Building cache (need >= 5 min)..."}
+
+        analyses: List[StrikeAnalysis] = []
+
+        for strike in sorted(current.strikes_oi.keys()):
+            c   = current.strikes_oi[strike]
+            p5  = s5.strikes_oi.get(strike)
+            p15 = s15.strikes_oi.get(strike) if s15 else None
+            p30 = s30.strikes_oi.get(strike) if s30 else None
+
+            # 5-min OI/Volume change
+            ce5  = self._pct(c.ce_oi,     p5.ce_oi     if p5 else 0)
+            pe5  = self._pct(c.pe_oi,     p5.pe_oi     if p5 else 0)
+            cv5  = self._pct(c.ce_volume, p5.ce_volume  if p5 else 0)
+            pv5  = self._pct(c.pe_volume, p5.pe_volume  if p5 else 0)
+
+            # 15-min OI/Volume change
+            ce15 = self._pct(c.ce_oi,     p15.ce_oi     if p15 else 0)
+            pe15 = self._pct(c.pe_oi,     p15.pe_oi     if p15 else 0)
+            cv15 = self._pct(c.ce_volume, p15.ce_volume  if p15 else 0)
+            pv15 = self._pct(c.pe_volume, p15.pe_volume  if p15 else 0)
+            pc15 = self._pct(c.pcr,       p15.pcr        if p15 else 0)
+
+            # 30-min OI/Volume change
+            ce30 = self._pct(c.ce_oi,     p30.ce_oi     if p30 else 0)
+            pe30 = self._pct(c.pe_oi,     p30.pe_oi     if p30 else 0)
+            cv30 = self._pct(c.ce_volume, p30.ce_volume  if p30 else 0)
+            pv30 = self._pct(c.pe_volume, p30.pe_volume  if p30 else 0)
+
+            is_atm = (strike == current.atm_strike)
+            dist   = abs(strike - current.atm_strike)
+            weight = ATM_WEIGHT if is_atm else (
+                NEAR_ATM_WEIGHT if dist <= STRIKE_INTERVAL else FAR_WEIGHT
+            )
+
+            tf5  = self._tf_signal(ce5,  pe5,  cv5,  pv5)
+            tf15 = self._tf_signal(ce15, pe15, cv15, pv15)
+            tf30 = self._tf_signal(ce30, pe30, cv30, pv30)
+            tfs  = [tf5, tf15, tf30]
+            mtf  = len(set(tfs)) == 1 and tfs[0] != "NEUTRAL"
+
+            vc, vs = self._vol_confirm((ce30 + pe30) / 2, (cv30 + pv30) / 2)
+            bull, bear = self._strength(ce30, pe30, cv30, pv30, weight, mtf)
+            if mtf:
+                bull = min(10.0, bull * 1.3)
+                bear = min(10.0, bear * 1.3)
+
+            if   bull >= 7 and bull > bear: rec, conf = "STRONG_CALL", bull
+            elif bear >= 7 and bear > bull: rec, conf = "STRONG_PUT",  bear
+            else:                           rec, conf = "WAIT", max(bull, bear)
+
+            analyses.append(StrikeAnalysis(
+                strike=strike, is_atm=is_atm, distance_atm=dist, weight=weight,
+                ce_oi=c.ce_oi, pe_oi=c.pe_oi,
+                ce_volume=c.ce_volume, pe_volume=c.pe_volume,
+                ce_ltp=c.ce_ltp, pe_ltp=c.pe_ltp,
+                ce_iv=c.ce_iv, pe_iv=c.pe_iv,
+                ce_oi_5=ce5, pe_oi_5=pe5, ce_vol_5=cv5, pe_vol_5=pv5,
+                ce_oi_15=ce15, pe_oi_15=pe15, ce_vol_15=cv15, pe_vol_15=pv15,
+                pcr_ch_15=pc15,
+                ce_oi_30=ce30, pe_oi_30=pe30, ce_vol_30=cv30, pe_vol_30=pv30,
+                pcr=c.pcr, ce_action=self._action(ce15), pe_action=self._action(pe15),
+                tf5_signal=tf5, tf15_signal=tf15, tf30_signal=tf30,
+                mtf_confirmed=mtf, vol_confirms=vc, vol_strength=vs,
+                is_support=False, is_resistance=False,
+                bull_strength=bull, bear_strength=bear,
+                recommendation=rec, confidence=conf
+            ))
+
+        sr = self._find_sr(current, analyses)
+        for sa in analyses:
+            sa.is_support    = (sa.strike == sr.support_strike)
+            sa.is_resistance = (sa.strike == sr.resistance_strike)
+
+        prev_pcr  = s30.overall_pcr if s30 else current.overall_pcr
+        pcr_trend = "BULLISH" if current.overall_pcr > prev_pcr else "BEARISH"
+        pcr_ch    = self._pct(current.overall_pcr, prev_pcr)
+        tb        = sum(sa.bull_strength for sa in analyses)
+        tr_b      = sum(sa.bear_strength for sa in analyses)
+
+        # v6.1: threshold = 8 (was 12), adjusted for ATM_RANGE=4 (9 strikes)
+        overall = ("BULLISH" if tb > tr_b and tb >= MTF_OVERALL_THRESHOLD
+                   else "BEARISH" if tr_b > tb and tr_b >= MTF_OVERALL_THRESHOLD
+                   else "NEUTRAL")
+
+        return {
+            "available":       True,
+            "strike_analyses": analyses,
+            "sr":              sr,
+            "overall":         overall,
+            "total_bull":      tb,
+            "total_bear":      tr_b,
+            "overall_pcr":     current.overall_pcr,
+            "pcr_trend":       pcr_trend,
+            "pcr_ch_pct":      pcr_ch,
+            "has_strong":      any(
+                sa.mtf_confirmed and sa.confidence >= MIN_CONFIDENCE
+                for sa in analyses
+            )
+        }
+
+    def _find_sr(self, current: MarketSnapshot,
+                 analyses: List[StrikeAnalysis]) -> SupportResistance:
+        mp = max(analyses, key=lambda x: x.pe_oi, default=None)
+        mc = max(analyses, key=lambda x: x.ce_oi, default=None)
+        sup = mp.strike if mp else current.atm_strike
+        res = mc.strike if mc else current.atm_strike
+        return SupportResistance(
+            support_strike=sup, support_put_oi=mp.pe_oi if mp else 0,
+            resistance_strike=res, resistance_call_oi=mc.ce_oi if mc else 0,
+            near_support=abs(current.spot_price - sup) <= ATM_PROX_PTS,
+            near_resistance=abs(current.spot_price - res) <= ATM_PROX_PTS
+        )
+
+
+# ============================================================
+#  PHASE DETECTOR
+# ============================================================
+
+class PhaseDetector:
+
+    COOLDOWN_P1 = 15 * 60
+    COOLDOWN_P2 = 10 * 60
+    COOLDOWN_P3 =  5 * 60
+
+    def __init__(self):
+        self._last: Dict[str, float] = {}
+        self._p1_at   = 0.0
+        self._p2_at   = 0.0
+        self._p1_side = ""
+
+    def _can(self, k: str, cd: int) -> bool:
+        return (time_module.time() - self._last.get(k, 0)) >= cd
+
+    def _mark(self, k: str):
+        self._last[k] = time_module.time()
+
+    @staticmethod
+    def _pct(c: float, p: float) -> float:
+        return ((c - p) / p * 100) if p > 0 else 0.0
+
+    async def detect(self, curr: MarketSnapshot,
+                     prev: Optional[MarketSnapshot],
+                     pa: PriceActionInsight) -> List[PhaseSignal]:
+        signals = []
+        if not prev:
+            return signals
+
+        ac = curr.strikes_oi.get(curr.atm_strike)
+        ap = prev.strikes_oi.get(curr.atm_strike)
+        if not ac or not ap:
+            return signals
+
+        ce_oi_ch  = self._pct(ac.ce_oi,    ap.ce_oi)
+        pe_oi_ch  = self._pct(ac.pe_oi,    ap.pe_oi)
+        ce_vol_ch = self._pct(ac.ce_volume, ap.ce_volume)
+        pe_vol_ch = self._pct(ac.pe_volume, ap.pe_volume)
+
+        call_bld = ce_oi_ch >= PHASE1_OI_BUILD_PCT   # v6.1: 6.0% threshold
+        put_bld  = pe_oi_ch >= PHASE1_OI_BUILD_PCT
+        if not (call_bld or put_bld):
+            return signals
+
+        dom   = "PUT" if (put_bld and pe_oi_ch >= ce_oi_ch) else "CALL"
+        oi_ch = pe_oi_ch if dom == "PUT" else ce_oi_ch
+        v_ch  = pe_vol_ch if dom == "PUT" else ce_vol_ch
+        dirn  = "BULLISH" if dom == "PUT" else "BEARISH"
+        now   = time_module.time()
+
+        # Phase 1 — Smart Money OI buildup (quiet volume)
+        if (oi_ch >= PHASE1_OI_BUILD_PCT and abs(v_ch) < PHASE1_VOL_MAX_PCT
+                and self._can("P1", self.COOLDOWN_P1)):
+            self._p1_at = now; self._p1_side = dom; self._mark("P1")
+            signals.append(PhaseSignal(
+                phase=1, dominant_side=dom, direction=dirn,
+                oi_change_pct=oi_ch, vol_change_pct=v_ch,
+                price_change_pct=pa.price_change_5m,
+                atm_strike=curr.atm_strike, spot_price=curr.spot_price,
+                confidence=min(10, oi_ch / 1.5),
+                message=(
+                    f"⚡ PHASE 1 - SMART MONEY POSITIONING\n\n"
+                    f"NIFTY: {curr.spot_price:,.2f}\nATM: {curr.atm_strike}\n\n"
+                    f"{'PUT' if dom=='PUT' else 'CALL'} OI: {oi_ch:+.1f}% (quiet buildup)\n"
+                    f"Volume: {v_ch:+.1f}% (still low — not a trap)\n\n"
+                    f"Signal: {dirn}\nTrend: {pa.trend.summary}\n\n"
+                    f"⏳ Wait for Phase 2 before entering!\n"
+                    f"{datetime.now(IST).strftime('%H:%M IST')}"
+                )
+            ))
+
+        # Phase 2 — Volume spike after Phase 1
+        p1_recent = (now - self._p1_at) < (25 * 60)
+        if (pa.vol_spike_ratio >= (1 + PHASE2_VOL_SPIKE_PCT / 100)  # v6.1: 15%
+                and oi_ch >= PHASE2_OI_MIN_PCT
+                and p1_recent and self._p1_side == dom
+                and self._can("P2", self.COOLDOWN_P2)):
+            self._p2_at = now; self._mark("P2")
+            signals.append(PhaseSignal(
+                phase=2, dominant_side=dom, direction=dirn,
+                oi_change_pct=oi_ch, vol_change_pct=v_ch,
+                price_change_pct=pa.price_change_5m,
+                atm_strike=curr.atm_strike, spot_price=curr.spot_price,
+                confidence=min(10, pa.vol_spike_ratio * 3),
+                message=(
+                    f"🔥 PHASE 2 - VOLUME SPIKE! MOVE IMMINENT\n\n"
+                    f"NIFTY: {curr.spot_price:,.2f}\nATM: {curr.atm_strike}\n\n"
+                    f"Volume: {pa.vol_spike_ratio:.1f}x average\n"
+                    f"OI: {oi_ch:+.1f}% (building since Phase 1)\n\n"
+                    f"Signal: {dirn}\nTrend: {pa.trend.summary}\n\n"
+                    f"👆 Finger on trigger! Wait for price confirmation!\n"
+                    f"{'BUY CALL' if dirn=='BULLISH' else 'BUY PUT'} near {curr.atm_strike}\n"
+                    f"{datetime.now(IST).strftime('%H:%M IST')}"
+                )
+            ))
+
+        # Phase 3 — Price confirmation (triple: OI + Volume + Price)
+        p2_recent  = (now - self._p2_at) < (15 * 60)
+        price_ok   = ((dirn == "BULLISH" and pa.price_change_5m >= PHASE3_PRICE_MOVE_PCT) or
+                      (dirn == "BEARISH" and pa.price_change_5m <= -PHASE3_PRICE_MOVE_PCT))
+        if p2_recent and price_ok and pa.triple_confirmed and self._can("P3", self.COOLDOWN_P3):
+            self._mark("P3")
+            signals.append(PhaseSignal(
+                phase=3, dominant_side=dom, direction=dirn,
+                oi_change_pct=oi_ch, vol_change_pct=v_ch,
+                price_change_pct=pa.price_change_5m,
+                atm_strike=curr.atm_strike, spot_price=curr.spot_price,
+                confidence=min(10, 7 + pa.trend_strength / 3),
+                message=(
+                    f"🚀 PHASE 3 - CONFIRMED! EXECUTE NOW!\n\n"
+                    f"NIFTY: {curr.spot_price:,.2f} ({pa.price_change_5m:+.2f}%/5min)\n"
+                    f"ATM: {curr.atm_strike}\n\n"
+                    f"Signal: {'BUY_CALL' if dirn=='BULLISH' else 'BUY_PUT'}\n"
+                    f"✅ Triple Confirmed: OI + Volume + Price ALL agree!\n\n"
+                    f"Trend: {pa.trend.summary}\n"
+                    f"VWAP: {pa.trend.vwap:.0f} | Spot {pa.trend.spot_vs_vwap} VWAP\n\n"
+                    f"OI: {oi_ch:+.1f}% | Vol: {pa.vol_spike_ratio:.1f}x | "
+                    f"Price: {pa.price_change_5m:+.2f}%\n"
+                    f"Trend Strength: {pa.trend_strength:.1f}/10\n\n"
+                    f"{datetime.now(IST).strftime('%H:%M IST')}\n"
+                    f"⏳ Sending to AI for confirmation..."
+                )
+            ))
+
+        return signals
+
+
+# ============================================================
+#  STANDALONE ALERT CHECKER
+# ============================================================
+
+class AlertChecker:
+    COOLDOWN = 30 * 60
+
+    def __init__(self, cache: DualCache, alerter):
+        self.cache   = cache
+        self.alerter = alerter
+        self._last: Dict[str, float] = {}
+
+    def _can(self, k: str) -> bool:
+        return (time_module.time() - self._last.get(k, 0)) >= self.COOLDOWN
+
+    def _mark(self, k: str):
+        self._last[k] = time_module.time()
+
+    async def check_all(self, curr: MarketSnapshot):
+        prev = await self.cache.get_5min_ago(6)
+        if not prev:
+            return
+        await self._oi(curr, prev)
+        await self._vol(curr, prev)
+        await self._pcr(curr, prev)
+        await self._prox(curr)
+
+    async def _oi(self, curr: MarketSnapshot, prev: MarketSnapshot):
+        if not self._can("OI"): return
+        ac = curr.strikes_oi.get(curr.atm_strike)
+        ap = prev.strikes_oi.get(curr.atm_strike)
+        if not ac or not ap or ap.ce_oi == 0 or ap.pe_oi == 0: return
+        ce = (ac.ce_oi - ap.ce_oi) / ap.ce_oi * 100
+        pe = (ac.pe_oi - ap.pe_oi) / ap.pe_oi * 100
+        if abs(ce) < OI_ALERT_PCT and abs(pe) < OI_ALERT_PCT: return
+        txt = (
+            f"📊 OI CHANGE ALERT (30-min)\n\n"
+            f"NIFTY: {curr.spot_price:,.2f} | ATM: {curr.atm_strike}\n\n"
+            f"CALL OI: {ce:+.1f}% {'BUILDING' if ce > 0 else 'UNWINDING'}\n"
+            f"PUT  OI: {pe:+.1f}% {'BUILDING' if pe > 0 else 'UNWINDING'}\n\n"
+            f"PCR: {curr.overall_pcr:.2f}\n"
+            f"{datetime.now(IST).strftime('%H:%M IST')}"
+        )
+        await self.alerter.send_raw(txt)
+        self._mark("OI")
+
+    async def _vol(self, curr: MarketSnapshot, prev: MarketSnapshot):
+        if not self._can("VOL"): return
+        ac = curr.strikes_oi.get(curr.atm_strike)
+        ap = prev.strikes_oi.get(curr.atm_strike)
+        if not ac or not ap or ap.ce_volume == 0 or ap.pe_volume == 0: return
+        cv = (ac.ce_volume - ap.ce_volume) / ap.ce_volume * 100
+        pv = (ac.pe_volume - ap.pe_volume) / ap.pe_volume * 100
+        if max(cv, pv) < VOL_SPIKE_PCT: return
+        dom = "CALL" if cv >= pv else "PUT"
+        txt = (
+            f"⚡ VOLUME SPIKE ALERT\n\n"
+            f"NIFTY: {curr.spot_price:,.2f} | ATM: {curr.atm_strike}\n\n"
+            f"CALL Vol: {cv:+.1f}% | PUT Vol: {pv:+.1f}%\n"
+            f"Dominant: {dom} → {'BEARISH' if dom=='CALL' else 'BULLISH'}\n"
+            f"{datetime.now(IST).strftime('%H:%M IST')}"
+        )
+        await self.alerter.send_raw(txt)
+        self._mark("VOL")
+
+    async def _pcr(self, curr: MarketSnapshot, prev: MarketSnapshot):
+        if not self._can("PCR") or prev.overall_pcr <= 0: return
+        ch = (curr.overall_pcr - prev.overall_pcr) / prev.overall_pcr * 100
+        if abs(ch) < PCR_ALERT_PCT: return
+        txt = (
+            f"📈 PCR CHANGE ALERT\n\n"
+            f"NIFTY: {curr.spot_price:,.2f}\n\n"
+            f"PCR: {prev.overall_pcr:.2f} → {curr.overall_pcr:.2f} ({ch:+.1f}%)\n"
+            f"{'Bulls gaining' if ch > 0 else 'Bears gaining'}\n"
+            f"{datetime.now(IST).strftime('%H:%M IST')}"
+        )
+        await self.alerter.send_raw(txt)
+        self._mark("PCR")
+
+    async def _prox(self, curr: MarketSnapshot):
+        if not self._can("PROX"): return
+        max_pe = max(curr.strikes_oi.items(), key=lambda x: x[1].pe_oi, default=None)
+        max_ce = max(curr.strikes_oi.items(), key=lambda x: x[1].ce_oi, default=None)
+        for level, item, kind in [("SUPPORT", max_pe, "PUT"), ("RESISTANCE", max_ce, "CALL")]:
+            if not item: continue
+            strike, oi_s = item
+            dist = abs(curr.spot_price - strike)
+            if dist > ATM_PROX_PTS: continue
+            oi_v = oi_s.pe_oi if kind == "PUT" else oi_s.ce_oi
+            txt  = (
+                f"🎯 PRICE NEAR {level}\n\n"
+                f"NIFTY: {curr.spot_price:,.2f}\n"
+                f"{level}: {strike} (OI: {oi_v:,.0f})\n"
+                f"Distance: {dist:.0f} pts\n"
+                f"{datetime.now(IST).strftime('%H:%M IST')}"
+            )
+            await self.alerter.send_raw(txt)
+            self._mark("PROX")
+            break
+
+
+# ============================================================
+#  CANDLESTICK PATTERN DETECTOR
+# ============================================================
+
 class PatternDetector:
-    """Enhanced candlestick pattern detection"""
-    
+
     @staticmethod
     def detect(df: pd.DataFrame) -> List[Dict]:
-        """Detect last 5 strong patterns"""
-        patterns = []
-        
-        if df.empty or len(df) < 2:
-            return patterns
-        
-        for i in range(len(df)):
-            if i < 1:
-                continue
-            
-            curr = df.iloc[i]
-            prev = df.iloc[i-1]
-            
-            body_curr = abs(curr['close'] - curr['open'])
-            body_prev = abs(prev['close'] - prev['open'])
-            range_curr = curr['high'] - curr['low']
-            
-            if range_curr == 0:
-                continue
-            
-            # Bullish Engulfing
-            if (curr['close'] > curr['open'] and 
-                prev['close'] < prev['open'] and
-                curr['open'] <= prev['close'] and
-                curr['close'] >= prev['open'] and
-                body_curr > body_prev * 1.2):
-                patterns.append({
-                    'time': curr.name,
-                    'pattern': 'BULLISH_ENGULFING',
-                    'type': 'BULLISH',
-                    'strength': 8,
-                    'price': curr['close']
-                })
-            
-            # Bearish Engulfing
-            elif (curr['close'] < curr['open'] and 
-                  prev['close'] > prev['open'] and
-                  curr['open'] >= prev['close'] and
-                  curr['close'] <= prev['open'] and
-                  body_curr > body_prev * 1.2):
-                patterns.append({
-                    'time': curr.name,
-                    'pattern': 'BEARISH_ENGULFING',
-                    'type': 'BEARISH',
-                    'strength': 8,
-                    'price': curr['close']
-                })
-            
+        """Detects patterns from 5min resampled candles"""
+        pats = []
+        if df.empty or len(df) < 2: return pats
+        for i in range(1, len(df)):
+            c, p = df.iloc[i], df.iloc[i-1]
+            bc  = abs(c.close - c.open)
+            bp  = abs(p.close - p.open)
+            rng = c.high - c.low
+            if rng == 0: continue
+
+            if (c.close > c.open and p.close < p.open
+                    and c.open <= p.close and c.close >= p.open and bc > bp * 1.2):
+                pats.append({"time": c.name, "pattern": "BULLISH_ENGULFING",
+                             "type": "BULLISH", "strength": 8, "price": c.close})
+            elif (c.close < c.open and p.close > p.open
+                    and c.open >= p.close and c.close <= p.open and bc > bp * 1.2):
+                pats.append({"time": c.name, "pattern": "BEARISH_ENGULFING",
+                             "type": "BEARISH", "strength": 8, "price": c.close})
             else:
-                lower_wick = min(curr['open'], curr['close']) - curr['low']
-                upper_wick = curr['high'] - max(curr['open'], curr['close'])
-                
-                # Hammer
-                if (lower_wick > body_curr * 2 and 
-                    upper_wick < body_curr * 0.3 and
-                    body_curr < range_curr * 0.35):
-                    patterns.append({
-                        'time': curr.name,
-                        'pattern': 'HAMMER',
-                        'type': 'BULLISH',
-                        'strength': 6,
-                        'price': curr['close']
-                    })
-                
-                # Shooting Star
-                elif (upper_wick > body_curr * 2 and 
-                      lower_wick < body_curr * 0.3 and
-                      body_curr < range_curr * 0.35):
-                    patterns.append({
-                        'time': curr.name,
-                        'pattern': 'SHOOTING_STAR',
-                        'type': 'BEARISH',
-                        'strength': 6,
-                        'price': curr['close']
-                    })
-                
-                # Doji
-                elif body_curr < range_curr * 0.1:
-                    patterns.append({
-                        'time': curr.name,
-                        'pattern': 'DOJI',
-                        'type': 'NEUTRAL',
-                        'strength': 4,
-                        'price': curr['close']
-                    })
-        
-        return patterns[-5:] if patterns else []
-    
+                lw = min(c.open, c.close) - c.low
+                hw = c.high - max(c.open, c.close)
+                if lw > bc * 2 and hw < bc * 0.3 and bc < rng * 0.35:
+                    pats.append({"time": c.name, "pattern": "HAMMER",
+                                 "type": "BULLISH", "strength": 7, "price": c.close})
+                elif hw > bc * 2 and lw < bc * 0.3 and bc < rng * 0.35:
+                    pats.append({"time": c.name, "pattern": "SHOOTING_STAR",
+                                 "type": "BEARISH", "strength": 7, "price": c.close})
+                elif bc < rng * 0.1:
+                    pats.append({"time": c.name, "pattern": "DOJI",
+                                 "type": "NEUTRAL", "strength": 4, "price": c.close})
+        return pats[-5:]
+
     @staticmethod
-    def calculate_support_resistance(df: pd.DataFrame) -> Tuple[float, float]:
-        """Calculate S/R from recent price action"""
-        if df.empty or len(df) < 10:
-            return 0.0, 0.0
-        
-        last_20 = df.tail(20)
-        support = last_20['low'].min()
-        resistance = last_20['high'].max()
-        
-        return support, resistance
+    def sr(df: pd.DataFrame) -> Tuple[float, float]:
+        """S/R from 30min candles (v6.1: was 15min)"""
+        if df.empty or len(df) < 5: return 0.0, 0.0
+        d = df.tail(20)
+        return float(d.low.min()), float(d.high.max())
 
 
-# ======================== ENHANCED OI + VOLUME ANALYZER ========================
-class EnhancedOIAnalyzer:
-    """Strike-wise OI + Volume analysis with PCR tracking"""
-    
-    def __init__(self, cache: SimpleCache):
-        self.cache = cache
-    
-    def _calculate_strike_weight(self, strike: int, atm: int) -> float:
-        """Calculate weight based on distance from ATM"""
-        distance = abs(strike - atm)
-        
-        if distance == 0:
-            return ATM_WEIGHT  # 3x
-        elif distance == STRIKE_INTERVAL:
-            return NEAR_ATM_WEIGHT  # 2x
-        else:
-            return FAR_WEIGHT  # 1x
-    
-    def _determine_writer_action(self, oi_change: float) -> str:
-        """Determine if writers are building or unwinding"""
-        if oi_change >= 10:
-            return "BUILDING"
-        elif oi_change <= -10:
-            return "UNWINDING"
-        else:
-            return "NEUTRAL"
-    
-    def _check_volume_confirmation(self, 
-                                   oi_change: float, 
-                                   vol_change: float) -> Tuple[bool, str]:
+# ============================================================
+#  DEEPSEEK PROMPT BUILDER
+# ============================================================
+
+class PromptBuilder:
+
+    @staticmethod
+    def _candles(df: pd.DataFrame, label: str) -> str:
+        if df.empty: return f"{label}: no data\n"
+        out = f"\n{label} (TIME|O|H|L|C|VOL|DIR):\n"
+        for ts, row in df.tail(CANDLE_COUNT).iterrows():
+            t = ts.strftime("%H:%M") if hasattr(ts, "strftime") else str(ts)[:5]
+            d = "▲" if row.close > row.open else "▼" if row.close < row.open else "-"
+            out += (f"{t}|{row.open:.0f}|{row.high:.0f}|{row.low:.0f}|"
+                    f"{row.close:.0f}|{int(row.volume)}|{d}\n")
+        return out
+
+    @staticmethod
+    def build(spot: float, atm: int, expiry: str, oi: Dict,
+              df_5m: pd.DataFrame, df_30m: pd.DataFrame,
+              patterns: List[Dict], p_sup: float, p_res: float,
+              pa: PriceActionInsight,
+              phase: Optional[PhaseSignal] = None) -> str:
         """
-        ✅ NEW: Check if volume confirms OI direction
-        Returns: (confirms, strength)
+        v6.1: df_15m replaced with df_30m throughout.
+        OI analysis uses DualCache 5/15/30min snapshot comparisons.
+        Price action uses Pandas/Numpy pre-calculations.
         """
-        # Both should move in same direction for confirmation
-        if oi_change > 10 and vol_change > MIN_VOLUME_CHANGE:
-            return True, "STRONG"  # OI + Volume both up = Real move
-        elif oi_change > 5 and vol_change > 10:
-            return True, "MODERATE"
-        elif oi_change < -10 and vol_change < -10:
-            return True, "STRONG"  # Both down = Unwinding
-        elif abs(oi_change) < 5 and abs(vol_change) < 5:
-            return True, "WEAK"  # Both neutral
-        else:
-            return False, "WEAK"  # Mismatch = Possible trap
-    
-    def _calculate_signal_strength(self, 
-                                   ce_oi_change: float, 
-                                   pe_oi_change: float,
-                                   ce_vol_change: float,
-                                   pe_vol_change: float,
-                                   weight: float) -> Tuple[float, float]:
-        """
-        ✅ ENHANCED: Calculate signal strength with Volume confirmation
-        """
-        
-        bullish_strength = 0.0
-        bearish_strength = 0.0
-        
-        # Check volume confirmation
-        ce_vol_confirms, ce_vol_strength = self._check_volume_confirmation(ce_oi_change, ce_vol_change)
-        pe_vol_confirms, pe_vol_strength = self._check_volume_confirmation(pe_oi_change, pe_vol_change)
-        
-        # Volume multiplier
-        vol_multiplier = 1.0
-        if ce_vol_strength == "STRONG" or pe_vol_strength == "STRONG":
-            vol_multiplier = 1.5  # Boost signal if volume confirms
-        elif ce_vol_strength == "WEAK" or pe_vol_strength == "WEAK":
-            vol_multiplier = 0.5  # Reduce signal if volume doesn't confirm
-        
-        # PUT OI building = BULLISH (only if volume confirms)
-        if pe_oi_change >= STRONG_OI_CHANGE and pe_vol_confirms:
-            bullish_strength = 9.0 * weight * vol_multiplier
-        elif pe_oi_change >= MIN_OI_CHANGE_15MIN and pe_vol_confirms:
-            bullish_strength = 7.0 * weight * vol_multiplier
-        elif pe_oi_change >= 5:
-            bullish_strength = 4.0 * weight * vol_multiplier
-        
-        # CALL OI building = BEARISH (only if volume confirms)
-        if ce_oi_change >= STRONG_OI_CHANGE and ce_vol_confirms:
-            bearish_strength = 9.0 * weight * vol_multiplier
-        elif ce_oi_change >= MIN_OI_CHANGE_15MIN and ce_vol_confirms:
-            bearish_strength = 7.0 * weight * vol_multiplier
-        elif ce_oi_change >= 5:
-            bearish_strength = 4.0 * weight * vol_multiplier
-        
-        # PUT OI unwinding = BEARISH
-        if pe_oi_change <= -STRONG_OI_CHANGE:
-            bearish_strength = max(bearish_strength, 8.0 * weight * vol_multiplier)
-        elif pe_oi_change <= -MIN_OI_CHANGE_15MIN:
-            bearish_strength = max(bearish_strength, 6.0 * weight * vol_multiplier)
-        
-        # CALL OI unwinding = BULLISH
-        if ce_oi_change <= -STRONG_OI_CHANGE:
-            bullish_strength = max(bullish_strength, 8.0 * weight * vol_multiplier)
-        elif ce_oi_change <= -MIN_OI_CHANGE_15MIN:
-            bullish_strength = max(bullish_strength, 6.0 * weight * vol_multiplier)
-        
-        return bullish_strength, bearish_strength
-    
-    async def analyze_strike(self, 
-                           strike: int,
-                           current: MarketSnapshot,
-                           snap_5min: Optional[MarketSnapshot],
-                           snap_15min: Optional[MarketSnapshot],
-                           snap_30min: Optional[MarketSnapshot]) -> StrikeAnalysis:
-        """Enhanced strike analysis with Volume"""
-        
-        curr_oi = current.strikes_oi.get(strike)
-        if not curr_oi:
-            return None
-        
-        # Calculate changes (OI + Volume)
-        def calc_change(current, previous):
-            if previous and previous > 0:
-                return ((current - previous) / previous * 100)
-            return 0
-        
-        prev_5 = snap_5min.strikes_oi.get(strike) if snap_5min else None
-        prev_15 = snap_15min.strikes_oi.get(strike) if snap_15min else None
-        prev_30 = snap_30min.strikes_oi.get(strike) if snap_30min else None
-        
-        # OI Changes
-        ce_oi_5min = calc_change(curr_oi.ce_oi, prev_5.ce_oi if prev_5 else 0)
-        pe_oi_5min = calc_change(curr_oi.pe_oi, prev_5.pe_oi if prev_5 else 0)
-        ce_oi_15min = calc_change(curr_oi.ce_oi, prev_15.ce_oi if prev_15 else 0)
-        pe_oi_15min = calc_change(curr_oi.pe_oi, prev_15.pe_oi if prev_15 else 0)
-        ce_oi_30min = calc_change(curr_oi.ce_oi, prev_30.ce_oi if prev_30 else 0)
-        pe_oi_30min = calc_change(curr_oi.pe_oi, prev_30.pe_oi if prev_30 else 0)
-        
-        # Volume Changes ✅ NEW
-        ce_vol_5min = calc_change(curr_oi.ce_volume, prev_5.ce_volume if prev_5 else 0)
-        pe_vol_5min = calc_change(curr_oi.pe_volume, prev_5.pe_volume if prev_5 else 0)
-        ce_vol_15min = calc_change(curr_oi.ce_volume, prev_15.ce_volume if prev_15 else 0)
-        pe_vol_15min = calc_change(curr_oi.pe_volume, prev_15.pe_volume if prev_15 else 0)
-        ce_vol_30min = calc_change(curr_oi.ce_volume, prev_30.ce_volume if prev_30 else 0)
-        pe_vol_30min = calc_change(curr_oi.pe_volume, prev_30.pe_volume if prev_30 else 0)
-        
-        # PCR change ✅ NEW
-        prev_15_pcr = prev_15.pcr if prev_15 else curr_oi.pcr
-        pcr_change_15min = calc_change(curr_oi.pcr, prev_15_pcr)
-        
-        # Calculate weight
-        is_atm = (strike == current.atm_strike)
-        distance = abs(strike - current.atm_strike)
-        weight = self._calculate_strike_weight(strike, current.atm_strike)
-        
-        # Writer actions
-        ce_action = self._determine_writer_action(ce_oi_15min)
-        pe_action = self._determine_writer_action(pe_oi_15min)
-        
-        # Volume confirmation ✅ NEW
-        vol_confirms, vol_strength = self._check_volume_confirmation(
-            (ce_oi_15min + pe_oi_15min) / 2,  # Average OI change
-            (ce_vol_15min + pe_vol_15min) / 2  # Average Volume change
-        )
-        
-        # Signal strengths (with volume confirmation)
-        bull_strength, bear_strength = self._calculate_signal_strength(
-            ce_oi_15min, pe_oi_15min,
-            ce_vol_15min, pe_vol_15min,
-            weight
-        )
-        
-        # Strike recommendation
-        if bull_strength >= 7 and bull_strength > bear_strength:
-            recommendation = "STRONG_CALL"
-            confidence = min(10, bull_strength)
-        elif bear_strength >= 7 and bear_strength > bull_strength:
-            recommendation = "STRONG_PUT"
-            confidence = min(10, bear_strength)
-        else:
-            recommendation = "WAIT"
-            confidence = max(bull_strength, bear_strength)
-        
-        return StrikeAnalysis(
-            strike=strike,
-            is_atm=is_atm,
-            distance_from_atm=distance,
-            weight=weight,
-            ce_oi=curr_oi.ce_oi,
-            pe_oi=curr_oi.pe_oi,
-            ce_volume=curr_oi.ce_volume,
-            pe_volume=curr_oi.pe_volume,
-            ce_ltp=curr_oi.ce_ltp,
-            pe_ltp=curr_oi.pe_ltp,
-            ce_oi_change_5min=ce_oi_5min,
-            pe_oi_change_5min=pe_oi_5min,
-            ce_oi_change_15min=ce_oi_15min,
-            pe_oi_change_15min=pe_oi_15min,
-            ce_oi_change_30min=ce_oi_30min,
-            pe_oi_change_30min=pe_oi_30min,
-            ce_vol_change_5min=ce_vol_5min,
-            pe_vol_change_5min=pe_vol_5min,
-            ce_vol_change_15min=ce_vol_15min,
-            pe_vol_change_15min=pe_vol_15min,
-            ce_vol_change_30min=ce_vol_30min,
-            pe_vol_change_30min=pe_vol_30min,
-            put_call_ratio=curr_oi.pcr,
-            pcr_change_15min=pcr_change_15min,
-            ce_writer_action=ce_action,
-            pe_writer_action=pe_action,
-            volume_confirms_oi=vol_confirms,
-            volume_strength=vol_strength,
-            is_support_level=False,
-            is_resistance_level=False,
-            bullish_signal_strength=bull_strength,
-            bearish_signal_strength=bear_strength,
-            strike_recommendation=recommendation,
-            confidence=confidence
-        )
-    
-    async def analyze(self, current: MarketSnapshot) -> Dict:
-        """Complete market analysis with Volume + PCR"""
-        snap_5min = await self.cache.get_minutes_ago(5)
-        snap_15min = await self.cache.get_minutes_ago(15)
-        snap_30min = await self.cache.get_minutes_ago(30)
-        
-        if not snap_5min:
-            return {
-                "available": False, 
-                "reason": "Building cache (need at least 5 min)..."
-            }
-        
-        # Analyze each strike
-        strike_analyses = []
-        for strike in sorted(current.strikes_oi.keys()):
-            analysis = await self.analyze_strike(strike, current, snap_5min, snap_15min, snap_30min)
-            if analysis:
-                strike_analyses.append(analysis)
-        
-        # Find Support/Resistance
-        support_resistance = self._find_support_resistance(current, strike_analyses)
-        
-        # Mark S/R strikes
-        for sa in strike_analyses:
-            sa.is_support_level = (sa.strike == support_resistance.support_strike)
-            sa.is_resistance_level = (sa.strike == support_resistance.resistance_strike)
-        
-        # Overall PCR trend ✅ NEW
-        prev_15_overall_pcr = snap_15min.overall_pcr if snap_15min else current.overall_pcr
-        pcr_trend = "BULLISH" if current.overall_pcr > prev_15_overall_pcr else "BEARISH"
-        pcr_change_pct = ((current.overall_pcr - prev_15_overall_pcr) / prev_15_overall_pcr * 100) if prev_15_overall_pcr > 0 else 0
-        
-        # Overall market signal
-        total_bull = sum(sa.bullish_signal_strength for sa in strike_analyses)
-        total_bear = sum(sa.bearish_signal_strength for sa in strike_analyses)
-        
-        if total_bull > total_bear and total_bull >= 10:
-            overall_signal = "BULLISH"
-        elif total_bear > total_bull and total_bear >= 10:
-            overall_signal = "BEARISH"
-        else:
-            overall_signal = "NEUTRAL"
-        
-        return {
-            "available": True,
-            "strike_analyses": strike_analyses,
-            "support_resistance": support_resistance,
-            "overall_signal": overall_signal,
-            "total_bullish_strength": total_bull,
-            "total_bearish_strength": total_bear,
-            "overall_pcr": current.overall_pcr,
-            "pcr_trend": pcr_trend,
-            "pcr_change_pct": pcr_change_pct,
-            "has_15min": snap_15min is not None,
-            "has_30min": snap_30min is not None,
-            "has_strong_signal": any(sa.confidence >= 7 for sa in strike_analyses)
-        }
-    
-    def _find_support_resistance(self, 
-                                 current: MarketSnapshot,
-                                 analyses: List[StrikeAnalysis]) -> SupportResistance:
-        """Find S/R levels from OI"""
-        
-        # Support = Highest PUT OI
-        max_put_oi = 0
-        support_strike = current.atm_strike
-        
-        for sa in analyses:
-            if sa.pe_oi > max_put_oi:
-                max_put_oi = sa.pe_oi
-                support_strike = sa.strike
-        
-        # Resistance = Highest CALL OI
-        max_call_oi = 0
-        resistance_strike = current.atm_strike
-        
-        for sa in analyses:
-            if sa.ce_oi > max_call_oi:
-                max_call_oi = sa.ce_oi
-                resistance_strike = sa.strike
-        
-        # Check if spot near S/R
-        spot = current.spot_price
-        near_support = abs(spot - support_strike) <= 50
-        near_resistance = abs(spot - resistance_strike) <= 50
-        
-        return SupportResistance(
-            support_strike=support_strike,
-            support_put_oi=max_put_oi,
-            resistance_strike=resistance_strike,
-            resistance_call_oi=max_call_oi,
-            spot_near_support=near_support,
-            spot_near_resistance=near_resistance
-        )
+        now = datetime.now(IST).strftime("%H:%M IST")
+        sr  = oi["sr"]
+        pcr = oi["overall_pcr"]
+        t   = pa.trend
+
+        p  = "You are an expert NIFTY 50 options trader. Analyze all data carefully and give a precise trade signal.\n\n"
+        p += f"=== MARKET | {now} | Expiry:{expiry} | Lot:{LOT_SIZE} | Strike interval:₹{STRIKE_INTERVAL} ===\n"
+        p += f"NIFTY Spot: ₹{spot:,.2f} | ATM: {atm} | PCR:{pcr:.2f}({oi['pcr_trend']}) Δ30m:{oi['pcr_ch_pct']:+.1f}%\n"
+        p += f"OI Support: {sr.support_strike} | OI Resistance: {sr.resistance_strike}\n"
+        if sr.near_support:    p += "⚠️ PRICE NEAR OI SUPPORT!\n"
+        if sr.near_resistance: p += "⚠️ PRICE NEAR OI RESISTANCE!\n"
+
+        p += f"\n=== MULTI-TIMEFRAME TREND ===\n"
+        p += f"Day(30min):{t.day_trend} | Intraday(5min):{t.intraday_trend} | Short(recent 5min):{t.trend_5min}\n"
+        p += f"VWAP: ₹{t.vwap:.0f} | Spot {t.spot_vs_vwap} VWAP | All TFs agree: {'YES ✅' if t.all_agree else 'NO ❌'}\n"
+        p += f"Summary: {t.summary}\n"
+
+        p += f"\n=== PRICE ACTION (Pandas/Numpy pre-calculated) ===\n"
+        p += f"Price change: 5m={pa.price_change_5m:+.2f}% | 15m={pa.price_change_15m:+.2f}% | 30m={pa.price_change_30m:+.2f}%\n"
+        p += f"Momentum: {pa.price_momentum} | Volume spike: {pa.vol_spike_ratio:.2f}x rolling avg\n"
+        p += f"OI-Volume correlation: {pa.oi_vol_corr:.2f} | Price-OI correlation: {pa.price_oi_corr:.2f}\n"
+        p += f"Trend strength: {pa.trend_strength:.1f}/10 | Triple confirmed (OI+Vol+Price): {'YES ✅' if pa.triple_confirmed else 'NO'}\n"
+        if pa.support_levels:
+            p += f"Price support levels: {', '.join(f'₹{s:.0f}' for s in pa.support_levels)}\n"
+        if pa.resistance_levels:
+            p += f"Price resistance levels: {', '.join(f'₹{r:.0f}' for r in pa.resistance_levels)}\n"
+
+        if phase:
+            p += f"\n=== ⚡ PHASE {phase.phase} SIGNAL DETECTED ===\n"
+            p += f"Side:{phase.dominant_side} | Direction:{phase.direction}\n"
+            p += f"OI change:{phase.oi_change_pct:+.1f}% | Vol change:{phase.vol_change_pct:+.1f}% | Price:{phase.price_change_pct:+.2f}%\n"
+
+        p += f"\n=== OI MULTI-TIMEFRAME ANALYSIS (DualCache snapshots) ===\n"
+        p += f"Note: 5min/15min/30min OI changes are from live option chain snapshots, NOT candles.\n"
+        p += "STRIKE | W | CE_OI(5%/15%/30%) | CE_VOL15% | CE_ACT | PE_OI(5%/15%/30%) | PE_VOL15% | PE_ACT | PCR | TF5/TF15/TF30 | MTF | CE_IV | PE_IV | Bull | Bear | Conf\n"
+        for sa in oi["strike_analyses"]:
+            tag = "ATM" if sa.is_atm else ("SUP" if sa.is_support else ("RES" if sa.is_resistance else "   "))
+            p += (
+                f"{sa.strike}({tag}) W{sa.weight:.0f} | "
+                f"CE:{sa.ce_oi_5:+.0f}%/{sa.ce_oi_15:+.0f}%/{sa.ce_oi_30:+.0f}% V:{sa.ce_vol_15:+.0f}%({sa.ce_action}) | "
+                f"PE:{sa.pe_oi_5:+.0f}%/{sa.pe_oi_15:+.0f}%/{sa.pe_oi_30:+.0f}% V:{sa.pe_vol_15:+.0f}%({sa.pe_action}) | "
+                f"PCR:{sa.pcr:.2f} | {sa.tf5_signal[:3]}/{sa.tf15_signal[:3]}/{sa.tf30_signal[:3]} | "
+                f"MTF:{'YES' if sa.mtf_confirmed else 'NO'} | "
+                f"IV:{sa.ce_iv:.1f}%/{sa.pe_iv:.1f}% | "
+                f"B:{sa.bull_strength:.0f} Br:{sa.bear_strength:.0f} C:{sa.confidence:.0f}\n"
+            )
+
+        # 5min resampled candles for short-term price action
+        p += PromptBuilder._candles(df_5m,  "5MIN CANDLES (1min resampled to 5min)")
+        # 30min candles for day context
+        p += PromptBuilder._candles(df_30m, "30MIN CANDLES (Upstox direct)")
+
+        if patterns:
+            p += "\n=== CANDLESTICK PATTERNS (on 5min candles) ===\n"
+            for pat in patterns:
+                ts = pat["time"].strftime("%H:%M") if hasattr(pat["time"], "strftime") else str(pat["time"])[:5]
+                p += f"{ts} | {pat['pattern']} | {pat['type']} | Strength:{pat['strength']}/10 | @₹{pat['price']:.0f}\n"
+
+        if p_sup or p_res:
+            p += f"\nCandle S/R (30min): Support=₹{p_sup:.0f} | Resistance=₹{p_res:.0f}\n"
+
+        p += f"""
+=== NIFTY 50 OPTIONS TRADING RULES ===
+OI INTERPRETATION:
+  CALL OI↑ + Volume↑ = Resistance forming = BEARISH → BUY PUT
+  PUT OI↑  + Volume↑ = Support forming   = BULLISH → BUY CALL
+  OI↑ but Volume flat = TRAP — do NOT trade!
+  MTF confirmed (TF5+TF15+TF30 all agree) = HIGHEST confidence signal
+
+TREND RULES:
+  Always trade WITH the day trend (30min)
+  All TFs agree + Spot above/below VWAP = HIGH confidence entry
+  Conflicting TFs = WAIT, do not force entry
+
+PRICE ACTION:
+  Triple confirmed (OI+Volume+Price all agree) = strongest signal
+  Spot above VWAP = bullish bias | Spot below VWAP = bearish bias
+  Price-OI correlation > 0.7 = strong confirmation
+
+IV RULES:
+  IV > 20% = expensive premium, prefer ATM only
+  IV < 12% = cheap, can consider ATM or 1 strike ITM
+  High IV difference (CE vs PE) = directional bias
+
+PCR:
+  PCR > {PCR_BULL} = bullish market bias
+  PCR < {PCR_BEAR} = bearish market bias
+
+NIFTY SPECIFICS:
+  Lot size={LOT_SIZE} | Strike interval=₹{STRIKE_INTERVAL}
+  SL = 1 strike away | Target = 2 strikes away
+  Best trading window: 9:30 AM - 3:00 PM IST
+  Entry: ONLY when MTF + Volume + Price + Trend ALL confirm
+
+RESPOND ONLY WITH VALID JSON (no markdown, no explanation):
+{{
+  "signal": "BUY_CALL" | "BUY_PUT" | "WAIT",
+  "primary_strike": {atm},
+  "confidence": 0-10,
+  "stop_loss_strike": 0,
+  "target_strike": 0,
+  "trend_analysis": {{
+    "day": "",
+    "intraday": "",
+    "all_agree": true,
+    "vwap_confirms": true,
+    "note": ""
+  }},
+  "mtf": {{
+    "tf5": "",
+    "tf15": "",
+    "tf30": "",
+    "confirmed": true
+  }},
+  "price_action": {{
+    "momentum": "",
+    "triple_confirmed": true,
+    "confirms_signal": true
+  }},
+  "candle_pattern": {{
+    "pattern": "",
+    "type": "",
+    "confirms_signal": true,
+    "near_sr": true
+  }},
+  "atm": {{
+    "ce_action": "",
+    "pe_action": "",
+    "vol_confirms": true,
+    "strength": ""
+  }},
+  "iv_note": {{
+    "ce_iv": 0,
+    "pe_iv": 0,
+    "note": ""
+  }},
+  "pcr": {{
+    "value": {pcr:.2f},
+    "trend": "{oi['pcr_trend']}",
+    "supports": true
+  }},
+  "volume": {{
+    "ok": true,
+    "spike_ratio": {pa.vol_spike_ratio:.2f},
+    "trap_warning": ""
+  }},
+  "entry": {{
+    "now": true,
+    "reason": "",
+    "wait_for": ""
+  }},
+  "rr": {{
+    "sl_pts": 0,
+    "tgt_pts": 0,
+    "ratio": 0
+  }},
+  "levels": {{
+    "oi_support": {sr.support_strike},
+    "oi_resistance": {sr.resistance_strike},
+    "candle_sup": {p_sup:.0f},
+    "candle_res": {p_res:.0f}
+  }}
+}}"""
+        return p
 
 
-# ======================== DEEPSEEK CLIENT ========================
+# ============================================================
+#  DEEPSEEK CLIENT
+# ============================================================
+
 class DeepSeekClient:
-    """DeepSeek API integration with 30-sec timeout"""
-    
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api.deepseek.com/v1/chat/completions"
-        self.model = "deepseek-chat"
-    
+    URL   = "https://api.deepseek.com/v1/chat/completions"
+    MODEL = "deepseek-chat"
+
+    def __init__(self, key: str):
+        self.key = key
+
     async def analyze(self, prompt: str) -> Optional[Dict]:
-        """Send prompt to DeepSeek with 30-sec timeout"""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+        hdrs = {
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type":  "application/json"
         }
-        
         payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 1500  # Increased for Volume analysis
+            "model":       self.MODEL,
+            "messages":    [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens":  1500
         }
-        
         try:
-            timeout = aiohttp.ClientTimeout(total=DEEPSEEK_TIMEOUT)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(self.base_url, headers=headers, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        content = data['choices'][0]['message']['content']
-                        
-                        # Extract JSON
-                        content = content.strip()
-                        if content.startswith('```json'):
-                            content = content[7:]
-                        if content.endswith('```'):
-                            content = content[:-3]
-                        content = content.strip()
-                        
-                        return json.loads(content)
-                    else:
-                        logger.error(f"❌ DeepSeek API error: {resp.status}")
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=DEEPSEEK_TIMEOUT)
+            ) as sess:
+                async with sess.post(self.URL, headers=hdrs, json=payload) as r:
+                    if r.status != 200:
+                        logger.error(f"DeepSeek {r.status}")
                         return None
+                    data    = await r.json()
+                    content = data["choices"][0]["message"]["content"].strip()
+                    # Strip markdown code blocks if present
+                    for f in ("```json", "```"):
+                        content = content.replace(f, "")
+                    return json.loads(content.strip())
         except asyncio.TimeoutError:
-            logger.error(f"❌ DeepSeek timeout (>{DEEPSEEK_TIMEOUT} seconds)")
+            logger.error("❌ DeepSeek timeout")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ JSON parse: {e}")
             return None
         except Exception as e:
-            logger.error(f"❌ DeepSeek error: {e}")
+            logger.error(f"❌ DeepSeek: {e}")
             return None
 
 
-# ======================== ENHANCED PROMPT BUILDER ========================
-class EnhancedPromptBuilder:
-    """Build detailed prompts with Volume + PCR data"""
-    
-    @staticmethod
-    def build(
-        spot: float,
-        atm: int,
-        oi_analysis: Dict,
-        candles_5min: pd.DataFrame,
-        patterns: List[Dict],
-        price_support: float,
-        price_resistance: float
-    ) -> str:
-        """Build comprehensive prompt with Volume + PCR"""
-        
-        now_time = datetime.now(IST).strftime('%H:%M IST')
-        
-        strike_analyses = oi_analysis.get("strike_analyses", [])
-        sr = oi_analysis.get("support_resistance")
-        overall_pcr = oi_analysis.get("overall_pcr", 0)
-        pcr_trend = oi_analysis.get("pcr_trend", "NEUTRAL")
-        pcr_change_pct = oi_analysis.get("pcr_change_pct", 0)
-        
-        # Header
-        prompt = f"""You are an expert NIFTY options trader with deep OI + Volume analysis skills.
+# ============================================================
+#  TELEGRAM ALERTER
+# ============================================================
 
-MARKET STATE:
-═════════════
-Time: {now_time}
-NIFTY Spot: ₹{spot:,.2f}
-ATM Strike: {atm}
-
-OVERALL PCR (Put-Call Ratio):
-══════════════════════════════
-Current PCR: {overall_pcr:.2f}
-15-min Change: {pcr_change_pct:+.1f}%
-Trend: {pcr_trend}
-"""
-        
-        if overall_pcr > 1.5:
-            prompt += "📊 HIGH PCR → Strong PUT base (BULLISH bias)\n"
-        elif overall_pcr < 0.7:
-            prompt += "📊 LOW PCR → Strong CALL base (BEARISH bias)\n"
-        
-        prompt += "\n"
-        
-        prompt += f"""
-SUPPORT/RESISTANCE (OI-Based):
-═══════════════════════════════
-🟢 Support: {sr.support_strike} (PUT OI: {sr.support_put_oi:,})
-🔴 Resistance: {sr.resistance_strike} (CALL OI: {sr.resistance_call_oi:,})
-"""
-        
-        if sr.spot_near_support:
-            prompt += f"⚡ ALERT: Spot NEAR SUPPORT ({sr.support_strike})!\n"
-        if sr.spot_near_resistance:
-            prompt += f"⚡ ALERT: Spot NEAR RESISTANCE ({sr.resistance_strike})!\n"
-        
-        prompt += "\n"
-        
-        # Strike-wise breakdown with Volume
-        prompt += "STRIKE-WISE OI + VOLUME ANALYSIS (15-MIN):\n"
-        prompt += "═" * 70 + "\n\n"
-        
-        for sa in strike_analyses:
-            weight_marker = ""
-            if sa.weight == ATM_WEIGHT:
-                weight_marker = " ⭐⭐⭐ (ATM - 3x WEIGHT)"
-            elif sa.weight == NEAR_ATM_WEIGHT:
-                weight_marker = " ⭐⭐ (NEAR ATM - 2x WEIGHT)"
-            else:
-                weight_marker = " ⭐ (1x WEIGHT)"
-            
-            sr_marker = ""
-            if sa.is_support_level:
-                sr_marker = " 🟢 SUPPORT LEVEL"
-            elif sa.is_resistance_level:
-                sr_marker = " 🔴 RESISTANCE LEVEL"
-            
-            # Volume confirmation marker ✅ NEW
-            vol_marker = ""
-            if sa.volume_confirms_oi:
-                vol_marker = f" ✅ VOL-{sa.volume_strength}"
-            else:
-                vol_marker = " ❌ VOL-MISMATCH (TRAP?)"
-            
-            prompt += f"Strike: {sa.strike}{weight_marker}{sr_marker}\n"
-            prompt += f"├─ CE OI: {sa.ce_oi:,} | 15min: {sa.ce_oi_change_15min:+.1f}% ({sa.ce_writer_action})\n"
-            prompt += f"├─ PE OI: {sa.pe_oi:,} | 15min: {sa.pe_oi_change_15min:+.1f}% ({sa.pe_writer_action})\n"
-            prompt += f"├─ CE VOL: {sa.ce_volume:,} | 15min: {sa.ce_vol_change_15min:+.1f}%{vol_marker}\n"
-            prompt += f"├─ PE VOL: {sa.pe_volume:,} | 15min: {sa.pe_vol_change_15min:+.1f}%{vol_marker}\n"
-            prompt += f"├─ PCR: {sa.put_call_ratio:.2f} (15min: {sa.pcr_change_15min:+.1f}%)\n"
-            prompt += f"├─ Bull Strength: {sa.bullish_signal_strength:.1f}/10\n"
-            prompt += f"├─ Bear Strength: {sa.bearish_signal_strength:.1f}/10\n"
-            prompt += f"└─ Signal: {sa.strike_recommendation} (Conf: {sa.confidence:.1f}/10)\n\n"
-        
-        # Price action (kept short)
-        prompt += "\nPRICE ACTION (Last 1 Hour - 5min candles):\n"
-        prompt += "═" * 70 + "\n\n"
-        
-        if not candles_5min.empty and len(candles_5min) > 0:
-            last_12 = candles_5min.tail(min(12, len(candles_5min)))
-            for idx, row in last_12.iterrows():
-                time_str = idx.strftime('%H:%M')
-                o, h, l, c = row['open'], row['high'], row['low'], row['close']
-                dir_emoji = "🟢" if c > o else "🔴" if c < o else "⚪"
-                delta = c - o
-                prompt += f"{time_str} | {o:.0f}→{c:.0f} (Δ{delta:+.0f}) | H:{h:.0f} L:{l:.0f} {dir_emoji}\n"
-            
-            prompt += f"\nPrice S/R: Support ₹{price_support:.2f} | Resistance ₹{price_resistance:.2f}\n"
-        else:
-            prompt += "No candle data available (focus on OI + Volume)\n"
-        
-        # Patterns
-        prompt += "\n\nKEY CANDLESTICK PATTERNS:\n"
-        prompt += "═" * 70 + "\n\n"
-        
-        if patterns:
-            for p in patterns:
-                time_str = p['time'].strftime('%H:%M')
-                prompt += f"{time_str}: {p['pattern']} | {p['type']} | Strength: {p['strength']}/10 | @ ₹{p['price']:.0f}\n"
-        else:
-            prompt += "No significant patterns detected\n"
-        
-        # Enhanced instructions with Volume
-        prompt += f"""
-
-ANALYSIS INSTRUCTIONS:
-═════════════════════
-
-🚨 CRITICAL OI + VOLUME LOGIC:
-─────────────────────────────────────
-✅ CORRECT INTERPRETATION:
-• CALL OI ↑ + Volume ↑ = Writers Building Resistance = BEARISH → BUY_PUT
-• PUT OI ↑ + Volume ↑ = Writers Building Support = BULLISH → BUY_CALL
-• CALL OI ↑ but Volume ↓ = TRAP (Weak move, ignore!)
-• PUT OI ↑ but Volume ↓ = TRAP (Weak move, ignore!)
-• OI ↓ + Volume ↑ = Unwinding = Reversal possible
-
-📊 TRIPLE CONFIRMATION REQUIRED:
-─────────────────────────────────
-1. ✅ OI Change (15-min) → Shows writer intent
-2. ✅ Volume Confirms OI → Shows real momentum
-3. ✅ Candlestick Pattern → Shows price action confirmation
-
-ALL 3 MUST ALIGN for STRONG signal!
-
-🎯 FOCUS PRIORITY:
-─────────────────
-1. ATM Strike (3x importance) - Look here FIRST
-2. Check if Volume confirms OI at ATM
-3. ATM ±50 Strikes (2x importance)
-4. Support/Resistance strikes
-5. Candlestick confirmation
-
-⚡ PCR INTERPRETATION:
-──────────────────────
-• PCR > 1.5 = Strong PUT base → BULLISH bias
-• PCR < 0.7 = Strong CALL base → BEARISH bias
-• PCR ↑ = Bulls gaining strength
-• PCR ↓ = Bears gaining strength
-
-🎯 SIGNAL DECISION:
-──────────────────
-- ATM shows STRONG CALL signal (7+) + Volume confirms → BUY_CALL
-- ATM shows STRONG PUT signal (7+) + Volume confirms → BUY_PUT
-- ATM signal strong BUT Volume doesn't confirm → WAIT (Possible TRAP)
-- Volume mismatch at key strikes → HIGH RISK, prefer WAIT
-
-RESPOND IN JSON:
-{{
-    "signal": "BUY_CALL" | "BUY_PUT" | "WAIT",
-    "primary_strike": {atm},
-    "confidence": 0-10,
-    "stop_loss_strike": strike_number,
-    "target_strike": strike_number,
-    
-    "atm_analysis": {{
-        "ce_oi_action": "BUILDING/UNWINDING/NEUTRAL",
-        "pe_oi_action": "BUILDING/UNWINDING/NEUTRAL",
-        "volume_confirms": true/false,
-        "volume_strength": "STRONG/MODERATE/WEAK",
-        "atm_signal": "CALL/PUT/WAIT",
-        "atm_confidence": 0-10
-    }},
-    
-    "pcr_analysis": {{
-        "current_pcr": {overall_pcr:.2f},
-        "pcr_trend": "{pcr_trend}",
-        "pcr_interpretation": "What PCR tells about market sentiment",
-        "pcr_supports_signal": true/false
-    }},
-    
-    "volume_confirmation": {{
-        "atm_volume_confirms_oi": true/false,
-        "trap_warning": "Any volume mismatch warnings",
-        "volume_quality": "STRONG/MODERATE/WEAK"
-    }},
-    
-    "strike_breakdown": [
-        {{
-            "strike": {atm},
-            "recommendation": "STRONG_CALL/STRONG_PUT/WAIT",
-            "volume_confirms": true/false,
-            "reason": "Why this strike + volume confirmation"
-        }}
-    ],
-    
-    "oi_support_resistance": {{
-        "oi_support": {sr.support_strike if sr else atm},
-        "oi_resistance": {sr.resistance_strike if sr else atm},
-        "spot_position": "NEAR_SUPPORT/NEAR_RESISTANCE/MID_RANGE",
-        "sr_impact": "How S/R affects trade decision"
-    }},
-    
-    "candlestick_confirmation": {{
-        "patterns_detected": ["list"],
-        "patterns_confirm_oi": true/false,
-        "pattern_strength": 0-10
-    }},
-    
-    "entry_timing": {{
-        "enter_now": true/false,
-        "reason": "Why now or why wait (include volume confirmation)",
-        "wait_for": "What to wait for if not entering"
-    }},
-    
-    "risk_reward": {{
-        "entry_premium_estimate": 0,
-        "sl_points": 0,
-        "target_points": 0,
-        "rr_ratio": 0
-    }}
-}}
-
-ONLY output valid JSON, no extra text.
-"""
-        
-        return prompt
-
-
-# ======================== TELEGRAM ALERTER ========================
 class TelegramAlerter:
-    """Enhanced Telegram alerts with Volume + PCR"""
-    
+
     def __init__(self, token: str, chat_id: str):
-        self.token = token
+        self.token   = token
         self.chat_id = chat_id
         self.session = None
-    
-    async def _ensure_session(self):
+
+    async def _sess(self):
         if not self.session:
             self.session = aiohttp.ClientSession()
-    
+
     async def close(self):
         if self.session:
             await self.session.close()
-    
-    async def send_signal(self, signal: Dict, spot: float, oi_data: Dict):
-        """Send enhanced signal with Volume + PCR"""
-        
-        confidence = signal.get('confidence', 0)
-        signal_type = signal.get('signal', 'WAIT')
-        primary_strike = signal.get('primary_strike', 0)
-        
-        atm_analysis = signal.get('atm_analysis', {})
-        pcr_analysis = signal.get('pcr_analysis', {})
-        volume_conf = signal.get('volume_confirmation', {})
-        
-        message = f"""🚨 NIFTY TRADE SIGNAL v5.1
 
-⏰ {datetime.now(IST).strftime('%d-%b %H:%M:%S IST')}
-
-💰 Spot: ₹{spot:,.2f}
-📊 Signal: <b>{signal_type}</b>
-⭐ Confidence: {confidence}/10
-
-💼 TRADE SETUP:
-━━━━━━━━━━━━━━━━━━━
-Entry: {primary_strike} {"CE" if "CALL" in signal_type else "PE" if "PUT" in signal_type else ""}
-SL: {signal.get('stop_loss_strike', 'N/A')}
-Target: {signal.get('target_strike', 'N/A')}
-RR: {signal.get('risk_reward', {}).get('rr_ratio', 'N/A')}
-
-📊 ATM ANALYSIS:
-━━━━━━━━━━━━━━━━━━━
-CE Writers: {atm_analysis.get('ce_oi_action', 'N/A')}
-PE Writers: {atm_analysis.get('pe_oi_action', 'N/A')}
-Volume Confirms: {"✅" if atm_analysis.get('volume_confirms') else "❌ TRAP WARNING!"}
-Volume Quality: {atm_analysis.get('volume_strength', 'N/A')}
-Signal: {atm_analysis.get('atm_signal', 'N/A')}
-
-📈 PCR ANALYSIS:
-━━━━━━━━━━━━━━━━━━━
-Current PCR: {pcr_analysis.get('current_pcr', 'N/A')}
-Trend: {pcr_analysis.get('pcr_trend', 'N/A')}
-Supports Signal: {"✅" if pcr_analysis.get('pcr_supports_signal') else "❌"}
-
-⚡ VOLUME CHECK:
-━━━━━━━━━━━━━━━━━━━
-ATM Vol Confirms: {"✅ YES" if volume_conf.get('atm_volume_confirms_oi') else "❌ NO - CAUTION"}
-Quality: {volume_conf.get('volume_quality', 'N/A')}
-"""
-        
-        if volume_conf.get('trap_warning'):
-            message += f"⚠️ WARNING: {volume_conf.get('trap_warning')}\n"
-        
-        message += f"""
-⏰ ENTRY TIMING:
-━━━━━━━━━━━━━━━━━━━
-Enter Now: {"✅ YES" if signal.get('entry_timing', {}).get('enter_now') else "⏳ WAIT"}
-Reason: {signal.get('entry_timing', {}).get('reason', 'N/A')}
-
-━━━━━━━━━━━━━━━━━━━
-🤖 DeepSeek V3 + Volume
-📊 Triple Confirmation v5.1
-"""
-        
+    async def send_raw(self, text: str):
+        await self._sess()
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         try:
-            await self._ensure_session()
-            
-            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            payload = {
+            async with self.session.post(url, json={
                 "chat_id": self.chat_id,
-                "text": message,
+                "text":    text,
                 "parse_mode": "HTML"
-            }
-            
-            async with self.session.post(url, json=payload) as resp:
-                if resp.status == 200:
-                    logger.info("✅ Enhanced alert sent to Telegram")
-                else:
-                    error_text = await resp.text()
-                    logger.error(f"❌ Telegram error: {resp.status} - {error_text}")
-        
+            }) as r:
+                if r.status != 200:
+                    txt = await r.text()
+                    logger.error(f"Telegram {r.status}: {txt[:100]}")
         except Exception as e:
-            logger.error(f"❌ Telegram error: {e}")
+            logger.error(f"❌ Telegram: {e}")
 
+    async def send_signal(self, sig: Dict, snap: MarketSnapshot,
+                          oi: Dict, pa: PriceActionInsight):
+        mtf  = sig.get("mtf",            {})
+        atma = sig.get("atm",            {})
+        pcra = sig.get("pcr",            {})
+        vol  = sig.get("volume",         {})
+        ent  = sig.get("entry",          {})
+        rr   = sig.get("rr",             {})
+        prce = sig.get("price_action",   {})
+        cndl = sig.get("candle_pattern", {})
+        trnd = sig.get("trend_analysis", {})
+        iv   = sig.get("iv_note",        {})
+        st   = sig.get("signal", "WAIT")
+        opt  = "CE" if "CALL" in st else "PE" if "PUT" in st else ""
+        t    = pa.trend
 
-# ======================== MAIN BOT ========================
-class NiftyOptionsBot:
-    """Enhanced main bot v5.1 with Volume + PCR + Detailed Logs"""
-    
-    def __init__(self):
-        self.upstox = UpstoxClient(UPSTOX_ACCESS_TOKEN)
-        self.cache = SimpleCache()
-        self.oi_analyzer = EnhancedOIAnalyzer(self.cache)
-        self.deepseek = DeepSeekClient(DEEPSEEK_API_KEY)
-        self.alerter = TelegramAlerter(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-        self.pattern_detector = PatternDetector()
-        self.prompt_builder = EnhancedPromptBuilder()
-    
-    def is_market_open(self) -> bool:
-        """Check if market is open"""
-        now = datetime.now(IST)
-        
-        if now.weekday() >= 5:
-            return False
-        
-        market_start = now.replace(hour=MARKET_START_HOUR, minute=MARKET_START_MIN)
-        market_end = now.replace(hour=MARKET_END_HOUR, minute=MARKET_END_MIN)
-        
-        return market_start <= now <= market_end
-    
-    async def fetch_market_data(self) -> Optional[MarketSnapshot]:
-        """Fetch market data with Volume"""
-        try:
-            expiry = await self.upstox.get_nearest_expiry()
-            if not expiry:
-                logger.warning("⚠️ Could not determine expiry")
-                return None
-            
-            logger.info(f"📅 Using expiry: {expiry}")
-            
-            await asyncio.sleep(API_DELAY)
-            chain_data = await self.upstox.get_option_chain(expiry)
-            
-            if not chain_data or chain_data.get("status") != "success":
-                logger.warning("⚠️ Could not fetch option chain")
-                return None
-            
-            chain = chain_data.get("data", [])
-            
-            if not chain or len(chain) == 0:
-                logger.warning(f"⚠️ Empty option chain")
-                return None
-            
-            # Extract spot
-            spot = 0.0
-            for item in chain:
-                spot = item.get("underlying_spot_price", 0.0)
-                if spot > 0:
-                    break
-            
-            if spot == 0:
-                logger.warning("⚠️ Could not extract spot price")
-                return None
-            
-            logger.info(f"💰 NIFTY Spot: ₹{spot:,.2f}")
-            
-            # Calculate ATM
-            atm = round(spot / STRIKE_INTERVAL) * STRIKE_INTERVAL
-            
-            # Extract strikes with Volume
-            min_strike = atm - (ATM_RANGE * STRIKE_INTERVAL)
-            max_strike = atm + (ATM_RANGE * STRIKE_INTERVAL)
-            
-            strikes_oi = {}
-            total_ce_oi = 0
-            total_pe_oi = 0
-            
-            for item in chain:
-                strike = item.get("strike_price")
-                
-                if not (min_strike <= strike <= max_strike):
-                    continue
-                
-                ce_data = item.get("call_options", {}).get("market_data", {})
-                pe_data = item.get("put_options", {}).get("market_data", {})
-                
-                ce_oi = ce_data.get("oi", 0)
-                pe_oi = pe_data.get("oi", 0)
-                ce_volume = ce_data.get("volume", 0)  # ✅ NEW
-                pe_volume = pe_data.get("volume", 0)  # ✅ NEW
-                
-                total_ce_oi += ce_oi
-                total_pe_oi += pe_oi
-                
-                pcr = (pe_oi / ce_oi) if ce_oi > 0 else 0  # ✅ NEW
-                
-                strikes_oi[strike] = OISnapshot(
-                    strike=strike,
-                    ce_oi=ce_oi,
-                    pe_oi=pe_oi,
-                    ce_volume=ce_volume,
-                    pe_volume=pe_volume,
-                    ce_ltp=ce_data.get("ltp", 0.0),
-                    pe_ltp=pe_data.get("ltp", 0.0),
-                    pcr=pcr,
-                    timestamp=datetime.now(IST)
-                )
-            
-            if not strikes_oi:
-                logger.warning(f"⚠️ No strikes found")
-                return None
-            
-            # Calculate overall PCR ✅ NEW
-            overall_pcr = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else 0
-            
-            logger.info(f"📊 Fetched {len(strikes_oi)} strikes | ATM: {atm} | PCR: {overall_pcr:.2f}")
-            
-            return MarketSnapshot(
-                timestamp=datetime.now(IST),
-                spot_price=spot,
-                atm_strike=atm,
-                strikes_oi=strikes_oi,
-                overall_pcr=overall_pcr
-            )
-            
-        except Exception as e:
-            logger.error(f"❌ Error fetching data: {e}")
-            logger.exception("Full traceback:")
-            return None
-    
-    def _log_detailed_analysis_data(self, 
-                                    current: MarketSnapshot,
-                                    oi_analysis: Dict,
-                                    candles_5min: pd.DataFrame,
-                                    patterns: List[Dict]):
-        """
-        ✅ NEW: Log all analysis data BEFORE sending to DeepSeek
-        This appears in Koyeb logs for debugging
-        """
-        logger.info("\n" + "="*70)
-        logger.info("📊 DETAILED ANALYSIS DATA (Before AI)")
-        logger.info("="*70)
-        
-        # Market State
-        logger.info(f"\n⏰ Time: {current.timestamp.strftime('%H:%M:%S IST')}")
-        logger.info(f"💰 Spot: ₹{current.spot_price:,.2f}")
-        logger.info(f"📅 ATM: {current.atm_strike}")
-        logger.info(f"📈 Overall PCR: {current.overall_pcr:.2f} ({oi_analysis.get('pcr_trend', 'N/A')})")
-        logger.info(f"📊 PCR Change (15min): {oi_analysis.get('pcr_change_pct', 0):+.1f}%")
-        
-        # S/R Levels
-        sr = oi_analysis.get("support_resistance")
-        if sr:
-            logger.info(f"\n🟢 Support: {sr.support_strike} (PUT OI: {sr.support_put_oi:,})")
-            logger.info(f"🔴 Resistance: {sr.resistance_strike} (CALL OI: {sr.resistance_call_oi:,})")
-            if sr.spot_near_support:
-                logger.info("⚡ Spot NEAR SUPPORT!")
-            if sr.spot_near_resistance:
-                logger.info("⚡ Spot NEAR RESISTANCE!")
-        
-        # Strike-wise OI + Volume
-        logger.info("\n📊 STRIKE-WISE OI + VOLUME (15-min):")
-        logger.info("-" * 70)
-        
-        strike_analyses = oi_analysis.get("strike_analyses", [])
-        for sa in strike_analyses:
-            atm_marker = " (ATM ⭐⭐⭐)" if sa.is_atm else ""
-            logger.info(f"\nStrike {sa.strike}{atm_marker}:")
-            logger.info(f"  CE OI: {sa.ce_oi:,} | 15min: {sa.ce_oi_change_15min:+.1f}% | Action: {sa.ce_writer_action}")
-            logger.info(f"  PE OI: {sa.pe_oi:,} | 15min: {sa.pe_oi_change_15min:+.1f}% | Action: {sa.pe_writer_action}")
-            logger.info(f"  CE Vol: {sa.ce_volume:,} | 15min: {sa.ce_vol_change_15min:+.1f}%")
-            logger.info(f"  PE Vol: {sa.pe_volume:,} | 15min: {sa.pe_vol_change_15min:+.1f}%")
-            logger.info(f"  PCR: {sa.put_call_ratio:.2f} (Change: {sa.pcr_change_15min:+.1f}%)")
-            logger.info(f"  Vol Confirms OI: {'✅ YES' if sa.volume_confirms_oi else '❌ NO (TRAP?)'}")
-            logger.info(f"  Vol Strength: {sa.volume_strength}")
-            logger.info(f"  Bull: {sa.bullish_signal_strength:.1f}/10 | Bear: {sa.bearish_signal_strength:.1f}/10")
-            logger.info(f"  Recommendation: {sa.strike_recommendation} (Conf: {sa.confidence:.1f}/10)")
-        
-        # Candlestick Data
-        logger.info("\n🕯️ CANDLESTICK DATA (Last 12 x 5-min):")
-        logger.info("-" * 70)
-        
-        if not candles_5min.empty and len(candles_5min) > 0:
-            last_12 = candles_5min.tail(12)
-            for idx, row in last_12.iterrows():
-                time_str = idx.strftime('%H:%M')
-                o, h, l, c = row['open'], row['high'], row['low'], row['close']
-                delta = c - o
-                dir_emoji = "🟢" if delta > 0 else "🔴" if delta < 0 else "⚪"
-                logger.info(f"  {time_str} | {o:.0f}→{c:.0f} (Δ{delta:+.0f}) | H:{h:.0f} L:{l:.0f} {dir_emoji}")
-        else:
-            logger.info("  No candle data available")
-        
-        # Patterns
-        if patterns:
-            logger.info("\n🎯 DETECTED PATTERNS:")
-            logger.info("-" * 70)
-            for p in patterns:
-                logger.info(f"  {p['time'].strftime('%H:%M')}: {p['pattern']} | {p['type']} | Strength: {p['strength']}/10")
-        
-        logger.info("\n" + "="*70)
-        logger.info("🤖 Now sending to DeepSeek AI...")
-        logger.info("="*70 + "\n")
-    
-    async def analyze_cycle(self):
-        """Main enhanced analysis cycle with detailed logging"""
-        logger.info("\n" + "="*70)
-        logger.info(f"🔍 ANALYSIS CYCLE v5.1 - {datetime.now(IST).strftime('%H:%M:%S')}")
-        logger.info("="*70)
-        
-        # Fetch data
-        current_snapshot = await self.fetch_market_data()
-        
-        if not current_snapshot:
-            logger.warning("⚠️ Skipping cycle - no data")
-            return
-        
-        # Add to cache
-        await self.cache.add(current_snapshot)
-        
-        # Enhanced OI + Volume analysis
-        oi_analysis = await self.oi_analyzer.analyze(current_snapshot)
-        
-        if not oi_analysis.get("available"):
-            logger.info(f"⏳ {oi_analysis.get('reason', 'Building cache...')}")
-            return
-        
-        # Check for strong signals
-        if not oi_analysis.get("has_strong_signal"):
-            logger.info("📊 No strong signals (all < 7 confidence)")
-            return
-        
-        logger.info("🚨 Strong signal detected! Proceeding...")
-        
-        # Fetch candles
-        candles_1min = await self.upstox.get_1min_candles()
-        
-        # Resample to 5-min
-        if not candles_1min.empty and len(candles_1min) >= 5:
-            try:
-                candles_5min = candles_1min.resample('5min').agg({
-                    'open': 'first',
-                    'high': 'max',
-                    'low': 'min',
-                    'close': 'last',
-                    'volume': 'sum'
-                }).dropna()
-                logger.info(f"📊 Resampled to {len(candles_5min)} 5-min candles")
-            except Exception as e:
-                logger.warning(f"⚠️ Resampling error: {e}")
-                candles_5min = pd.DataFrame()
-        else:
-            candles_5min = pd.DataFrame()
-        
-        # Detect patterns
-        patterns = self.pattern_detector.detect(candles_5min) if not candles_5min.empty else []
-        
-        # Calculate price S/R
-        price_support, price_resistance = self.pattern_detector.calculate_support_resistance(candles_5min)
-        
-        # ✅ NEW: Log detailed analysis data
-        self._log_detailed_analysis_data(current_snapshot, oi_analysis, candles_5min, patterns)
-        
-        # Build prompt
-        prompt = self.prompt_builder.build(
-            spot=current_snapshot.spot_price,
-            atm=current_snapshot.atm_strike,
-            oi_analysis=oi_analysis,
-            candles_5min=candles_5min,
-            patterns=patterns,
-            price_support=price_support,
-            price_resistance=price_resistance
+        conf = sig.get("confidence", 0)
+        conf_bar = "🟢" * min(conf, 10) + "⚪" * (10 - min(conf, 10))
+
+        msg = (
+            f"🚀 NIFTY OPTIONS SIGNAL v6.1 PRO\n"
+            f"📅 {datetime.now(IST).strftime('%d-%b-%Y %H:%M IST')}\n\n"
+            f"💰 NIFTY: ₹{snap.spot_price:,.2f}\n"
+            f"📊 Signal: <b>{st}</b>\n"
+            f"⭐ Confidence: {conf}/10  {conf_bar}\n"
+            f"📅 Expiry: {snap.expiry} | Lot: {LOT_SIZE}\n\n"
+            f"━━━ TRADE SETUP ━━━\n"
+            f"Entry: <b>{sig.get('primary_strike', 0)} {opt}</b>\n"
+            f"SL: {sig.get('stop_loss_strike', 0)} {opt}\n"
+            f"Target: {sig.get('target_strike', 0)} {opt}\n"
+            f"RR Ratio: {rr.get('ratio', 'N/A')} "
+            f"(SL:{rr.get('sl_pts', 0)}pts → Tgt:{rr.get('tgt_pts', 0)}pts)\n\n"
+            f"━━━ TREND ━━━\n"
+            f"Day(30m):{t.day_trend} | Intraday:{t.intraday_trend} | 5min:{t.trend_5min}\n"
+            f"VWAP: ₹{t.vwap:.0f} | Spot {t.spot_vs_vwap} VWAP\n"
+            f"All TFs agree: {'✅ YES' if trnd.get('all_agree') else '❌ NO'} | "
+            f"VWAP confirms: {'✅' if trnd.get('vwap_confirms') else '❌'}\n\n"
+            f"━━━ MTF OI ANALYSIS ━━━\n"
+            f"TF5:{mtf.get('tf5','N/A')} | TF15:{mtf.get('tf15','N/A')} | TF30:{mtf.get('tf30','N/A')}\n"
+            f"MTF Confirmed: {'✅ HIGH CONFIDENCE' if mtf.get('confirmed') else '❌ Single TF only'}\n\n"
+            f"━━━ OI DATA ━━━\n"
+            f"ATM CE: {atma.get('ce_action','N/A')} | ATM PE: {atma.get('pe_action','N/A')}\n"
+            f"Volume confirms: {'✅ YES' if atma.get('vol_confirms') else '❌ NO — POSSIBLE TRAP'}\n\n"
+            f"━━━ PRICE ACTION ━━━\n"
+            f"5m:{pa.price_change_5m:+.2f}% | 15m:{pa.price_change_15m:+.2f}% | "
+            f"30m:{pa.price_change_30m:+.2f}%\n"
+            f"Triple confirmed: {'✅' if pa.triple_confirmed else '❌'} | "
+            f"Vol: {pa.vol_spike_ratio:.1f}x avg\n\n"
+            f"━━━ PATTERNS & LEVELS ━━━\n"
+            f"Pattern: {cndl.get('pattern','None')} ({cndl.get('type','')})\n"
+            f"Near S/R: {'✅ YES' if cndl.get('near_sr') else 'NO'} | "
+            f"Confirms: {'✅' if cndl.get('confirms_signal') else '❌'}\n\n"
+            f"━━━ PCR & IV ━━━\n"
+            f"PCR: {pcra.get('value','N/A')} ({pcra.get('trend','N/A')}) | "
+            f"Supports signal: {'✅' if pcra.get('supports') else '❌'}\n"
+            f"IV: CE={iv.get('ce_iv',0):.1f}% PE={iv.get('pe_iv',0):.1f}%\n"
+            f"{iv.get('note','')}\n\n"
+            f"━━━ ENTRY DECISION ━━━\n"
+            f"Enter now: {'✅ YES' if ent.get('now') else '⏳ WAIT'}\n"
+            f"{ent.get('reason','')}\n"
+            f"{('Wait for: ' + ent.get('wait_for','')) if not ent.get('now') and ent.get('wait_for') else ''}\n\n"
+            f"DeepSeek V3 | NIFTY v6.1 Pro | Upstox V2"
         )
-        
-        logger.info(f"🤖 Sending to DeepSeek (timeout: {DEEPSEEK_TIMEOUT}s)...")
-        
-        # Get AI signal
-        ai_signal = await self.deepseek.analyze(prompt)
-        
-        if not ai_signal:
-            logger.warning("⚠️ DeepSeek timeout - using fallback")
-            
-            # Fallback logic
-            strike_analyses = oi_analysis.get("strike_analyses", [])
-            atm_strike = next((sa for sa in strike_analyses if sa.is_atm), None)
-            
-            if atm_strike and atm_strike.volume_confirms_oi:
-                if atm_strike.bullish_signal_strength > atm_strike.bearish_signal_strength:
-                    fallback_signal = "BUY_CALL"
-                    fallback_conf = min(10, atm_strike.bullish_signal_strength)
-                else:
-                    fallback_signal = "BUY_PUT"
-                    fallback_conf = min(10, atm_strike.bearish_signal_strength)
-            else:
-                fallback_signal = "WAIT"
-                fallback_conf = 3
-            
-            ai_signal = {
-                'signal': fallback_signal,
-                'confidence': fallback_conf,
-                'primary_strike': current_snapshot.atm_strike,
-                'atm_analysis': {'volume_confirms': atm_strike.volume_confirms_oi if atm_strike else False},
-                'volume_confirmation': {'trap_warning': 'AI unavailable'},
-                'entry_timing': {'enter_now': False, 'reason': 'AI timeout'}
-            }
-        
-        confidence = ai_signal.get('confidence', 0)
-        signal_type = ai_signal.get('signal', 'WAIT')
-        
-        logger.info(f"🎯 Signal: {signal_type} | Confidence: {confidence}/10")
-        
-        # Send alert
-        if confidence >= MIN_CONFIDENCE:
-            logger.info("✅ Sending Telegram alert...")
-            await self.alerter.send_signal(ai_signal, current_snapshot.spot_price, oi_analysis)
-        else:
-            logger.info(f"⏳ Low confidence ({confidence}/10), no alert")
-        
-        logger.info("="*70 + "\n")
-    
+        if vol.get("trap_warning"):
+            msg += f"\n\n⚠️ WARNING: {vol['trap_warning']}"
+        await self.send_raw(msg.strip())
+
+
+# ============================================================
+#  MAIN BOT
+# ============================================================
+
+class NiftyOptionsBot:
+
+    def __init__(self):
+        self.upstox  = UpstoxClient(UPSTOX_ACCESS_TOKEN)
+        self.cache   = DualCache()
+        self.mtf     = MTFAnalyzer(self.cache)
+        self.ai      = DeepSeekClient(DEEPSEEK_API_KEY)
+        self.alerter = TelegramAlerter(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        self.checker = AlertChecker(self.cache, self.alerter)
+        self.phase   = PhaseDetector()
+        self._cycle  = 0
+        self._expiry: Optional[str] = None
+        # v6.1: expiry refreshed daily once, not every 30min
+        self._expiry_fetched_date: Optional[str] = None
+
+    def is_market_open(self) -> bool:
+        now = datetime.now(IST)
+        if now.weekday() >= 5: return False
+        s = now.replace(hour=MARKET_START[0], minute=MARKET_START[1], second=0)
+        e = now.replace(hour=MARKET_END[0],   minute=MARKET_END[1],   second=0)
+        return s <= now <= e
+
+    async def _refresh_expiry_if_needed(self):
+        """
+        v6.1 fix: Expiry refresh only once per trading day.
+        Previous code refreshed every 30min — unnecessary API calls.
+        """
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        if self._expiry_fetched_date == today_str and self._expiry:
+            return  # Already fetched today
+        logger.info("🔄 Fetching expiry (daily refresh)...")
+        self._expiry = await self.upstox.get_nearest_expiry()
+        self._expiry_fetched_date = today_str
+
     async def run(self):
-        """Main bot loop"""
-        logger.info("\n" + "="*70)
-        logger.info("🚀 NIFTY OPTIONS BOT v5.1 - VOLUME + PCR!")
-        logger.info("="*70)
-        logger.info(f"📅 {datetime.now(IST).strftime('%d-%b-%Y %A')}")
-        logger.info(f"🕐 {datetime.now(IST).strftime('%H:%M:%S IST')}")
-        logger.info(f"⏱️  Interval: {ANALYSIS_INTERVAL // 60} minutes")
-        logger.info(f"📊 Features: OI + Volume + PCR + Candlestick")
-        logger.info(f"🤖 AI: DeepSeek V3 ({DEEPSEEK_TIMEOUT}s timeout)")
-        logger.info(f"✅ Triple Confirmation: OI + Volume + Pattern")
-        logger.info("="*70 + "\n")
-        
+        logger.info("=" * 60)
+        logger.info("NIFTY OPTIONS BOT v6.1 PRO — Koyeb")
+        logger.info(f"ATM_RANGE=±{ATM_RANGE} (±{ATM_RANGE*STRIKE_INTERVAL}pts) | "
+                    f"Strikes={(ATM_RANGE*2)+1}")
+        logger.info(f"Phase1 OI>={PHASE1_OI_BUILD_PCT}% | Phase2 Vol>={PHASE2_VOL_SPIKE_PCT}%")
+        logger.info(f"MTF threshold={MTF_OVERALL_THRESHOLD} | Lot={LOT_SIZE}")
+        logger.info(f"Candles: 1min+resample5min + 30min direct (Upstox V2)")
+        logger.info("=" * 60)
+
         await self.upstox.init()
-        
+        await self._refresh_expiry_if_needed()
+
         try:
             while True:
+                if not self.is_market_open():
+                    logger.info("Market closed — waiting 60s")
+                    await asyncio.sleep(60)
+                    continue
                 try:
-                    if self.is_market_open():
-                        await self.analyze_cycle()
-                    else:
-                        logger.info("💤 Market closed")
-                    
-                    next_run = datetime.now(IST) + timedelta(seconds=ANALYSIS_INTERVAL)
-                    logger.info(f"⏰ Next: {next_run.strftime('%H:%M:%S')}\n")
-                    
-                    await asyncio.sleep(ANALYSIS_INTERVAL)
-                
+                    await self._cycle_run()
+                except aiohttp.ClientConnectorError:
+                    logger.error("❌ Network error — retry 60s")
+                    await asyncio.sleep(60)
                 except Exception as e:
                     logger.error(f"❌ Cycle error: {e}")
                     logger.exception("Traceback:")
                     await asyncio.sleep(60)
-        
+
+                s5, s30 = self.cache.sizes()
+                logger.info(f"⏱ Next in {SNAPSHOT_INTERVAL//60}min | Cache: 5m={s5} 30m={s30}")
+                await asyncio.sleep(SNAPSHOT_INTERVAL)
+
         except KeyboardInterrupt:
-            logger.info("\n🛑 Stopped")
-        
+            logger.info("Stopped by user")
         finally:
             await self.upstox.close()
             await self.alerter.close()
-            logger.info("👋 Closed")
+
+    async def _cycle_run(self):
+        self._cycle += 1
+        is_analysis = (self._cycle % 6 == 0)   # every 30min
+
+        # v6.1: expiry daily refresh (not every 30min)
+        await self._refresh_expiry_if_needed()
+
+        if not self._expiry:
+            logger.warning("No expiry — skipping cycle")
+            return
+
+        logger.info(
+            f"{'📊 ANALYSIS' if is_analysis else '📦 SNAPSHOT'} "
+            f"#{self._cycle} | {datetime.now(IST).strftime('%H:%M IST')}"
+        )
+
+        # 1. Fetch option chain snapshot
+        snap = await self.upstox.fetch_snapshot(self._expiry)
+        if not snap:
+            logger.warning("⚠️ Snapshot failed")
+            return
+
+        await self.cache.add_5min(snap)
+        if is_analysis:
+            await self.cache.add_30min(snap)
+
+        # 2. Standalone OI/PCR/Volume alerts
+        await self.checker.check_all(snap)
+
+        # 3. v6.1 FIXED: 2 API calls (was 3, 5min/15min were invalid on Upstox V2)
+        #    df_1m  = last CANDLE_COUNT 1min candles (for VWAP)
+        #    df_5m  = 1min resampled to 5min (price action, patterns, trend)
+        #    df_30m = 30min direct from Upstox (day trend, S/R)
+        df_1m, df_5m, df_30m = await self.upstox.get_candles()
+
+        # 4. Pre-calculate price action with Pandas/Numpy
+        recent = await self.cache.get_recent(12)
+        pa = PriceActionCalculator.calculate(recent, df_1m, df_5m, df_30m)
+        logger.info(
+            f"Price: 5m={pa.price_change_5m:+.2f}% | "
+            f"Vol:{pa.vol_spike_ratio:.2f}x | Triple:{pa.triple_confirmed}"
+        )
+        logger.info(f"Trend: {pa.trend.summary}")
+
+        # 5. Phase detection (OI+Volume+Price progression)
+        prev   = await self.cache.get_5min_ago(1)
+        phases = await self.phase.detect(snap, prev, pa)
+
+        for ps in phases:
+            logger.info(f"⚡ Phase {ps.phase}: {ps.direction}")
+            await self.alerter.send_raw(ps.message)
+            if ps.phase == 3:
+                await self._ai_call(snap, pa, ps, df_5m, df_30m)
+
+        # 6. Full MTF analysis every 30min
+        if is_analysis:
+            await self._full_analysis(snap, pa, df_5m, df_30m)
+
+    async def _ai_call(self, snap: MarketSnapshot, pa: PriceActionInsight,
+                       ps: PhaseSignal, df_5m: pd.DataFrame, df_30m: pd.DataFrame):
+        logger.info("🤖 Phase 3 → calling DeepSeek V3...")
+        oi = await self.mtf.analyze(snap)
+        if not oi["available"]:
+            oi = {
+                "available": True, "strike_analyses": [],
+                "sr": SupportResistance(snap.atm_strike, 0, snap.atm_strike, 0, False, False),
+                "overall": ps.direction, "total_bull": 0, "total_bear": 0,
+                "overall_pcr": snap.overall_pcr, "pcr_trend": "N/A",
+                "pcr_ch_pct": 0, "has_strong": True
+            }
+
+        patterns     = PatternDetector.detect(df_5m)
+        p_sup, p_res = PatternDetector.sr(df_30m)
+        prompt       = PromptBuilder.build(
+            snap.spot_price, snap.atm_strike, snap.expiry,
+            oi, df_5m, df_30m, patterns, p_sup, p_res, pa, ps
+        )
+        ai_sig = await self.ai.analyze(prompt)
+        if ai_sig and ai_sig.get("confidence", 0) >= MIN_CONFIDENCE:
+            await self.alerter.send_signal(ai_sig, snap, oi, pa)
+
+    async def _full_analysis(self, snap: MarketSnapshot, pa: PriceActionInsight,
+                             df_5m: pd.DataFrame, df_30m: pd.DataFrame):
+        logger.info("📊 Full MTF analysis (30min cycle)...")
+        oi = await self.mtf.analyze(snap)
+        if not oi["available"]:
+            logger.info(oi["reason"])
+            return
+        if not oi["has_strong"]:
+            logger.info("No strong MTF signal — skipping AI call")
+            return
+
+        patterns     = PatternDetector.detect(df_5m)
+        p_sup, p_res = PatternDetector.sr(df_30m)
+        prompt       = PromptBuilder.build(
+            snap.spot_price, snap.atm_strike, snap.expiry,
+            oi, df_5m, df_30m, patterns, p_sup, p_res, pa, None
+        )
+        logger.info("🤖 DeepSeek V3...")
+        ai_sig = await self.ai.analyze(prompt)
+
+        if not ai_sig:
+            # Fallback: use MTF pre-calculations
+            sa = next((s for s in oi["strike_analyses"] if s.is_atm), None)
+            fb = ("BUY_CALL" if sa and sa.bull_strength > sa.bear_strength
+                  else "BUY_PUT" if sa else "WAIT")
+            fc = min(10, max(sa.bull_strength, sa.bear_strength)) if sa else 3
+            ai_sig = {
+                "signal": fb, "confidence": fc,
+                "primary_strike": snap.atm_strike,
+                "mtf":          {"tf5":"N/A","tf15":"N/A","tf30":"N/A","confirmed":False},
+                "entry":        {"now":False,"reason":"AI timeout — using MTF fallback","wait_for":""},
+                "price_action": {"momentum":pa.price_momentum,
+                                 "triple_confirmed":pa.triple_confirmed,
+                                 "confirms_signal":False},
+                "candle_pattern":{"pattern":"N/A","type":"","confirms_signal":False,"near_sr":False},
+                "trend_analysis":{"day":pa.trend.day_trend,"intraday":pa.trend.intraday_trend,
+                                  "all_agree":pa.trend.all_agree,"vwap_confirms":False,"note":""},
+                "iv_note":      {"ce_iv":0,"pe_iv":0,"note":""},
+                "volume":       {"ok":False,"spike_ratio":pa.vol_spike_ratio,"trap_warning":""},
+                "rr":{},"atm":{},"pcr":{},"levels":{}
+            }
+
+        conf = ai_sig.get("confidence", 0)
+        logger.info(f"Signal: {ai_sig.get('signal','WAIT')} | Conf:{conf}/10")
+        if conf >= MIN_CONFIDENCE:
+            await self.alerter.send_signal(ai_sig, snap, oi, pa)
 
 
-# ======================== HTTP WRAPPER ========================
-async def health_check(request):
-    """Health endpoint"""
-    return aiohttp.web.Response(text="✅ NIFTY Bot v5.1 Running! (Volume + PCR)")
+# ============================================================
+#  HTTP SERVER — Koyeb keep-alive
+# ============================================================
+
+bot_instance: Optional[NiftyOptionsBot] = None
+
+async def health(request):
+    """
+    Health endpoint for Koyeb.
+    Cache-Control: no-cache ensures Koyeb/UptimeRobot always gets fresh response.
+    """
+    if bot_instance:
+        s5, s30 = bot_instance.cache.sizes()
+        mkt     = "OPEN" if bot_instance.is_market_open() else "CLOSED"
+        expiry  = bot_instance._expiry or "fetching..."
+        status  = (
+            f"NIFTY Bot v6.1 PRO | ALIVE ✅\n"
+            f"Time: {datetime.now(IST).strftime('%d-%b %H:%M IST')}\n"
+            f"Market: {mkt} | Expiry: {expiry}\n"
+            f"Cache: 5min={s5}/{CACHE_5MIN_SIZE} | 30min={s30}/{CACHE_30MIN_SIZE}\n"
+            f"ATM_RANGE=±{ATM_RANGE} | Phase1≥{PHASE1_OI_BUILD_PCT}% | Phase2≥{PHASE2_VOL_SPIKE_PCT}%"
+        )
+    else:
+        status = "NIFTY Bot v6.1 | Starting..."
+
+    return aiohttp.web.Response(
+        text=status,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma":        "no-cache",
+            "Expires":       "0"
+        }
+    )
+
+async def start_bot(app):
+    global bot_instance
+    bot_instance  = NiftyOptionsBot()
+    app["bot_task"] = asyncio.create_task(bot_instance.run())
+
+async def stop_bot(app):
+    if "bot_task" in app:
+        app["bot_task"].cancel()
+        try:
+            await app["bot_task"]
+        except asyncio.CancelledError:
+            pass
+    if bot_instance:
+        await bot_instance.upstox.close()
+        await bot_instance.alerter.close()
 
 
-async def start_bot_background(app):
-    """Start bot"""
-    app['bot_task'] = asyncio.create_task(run_trading_bot())
+# ============================================================
+#  ENTRY POINT
+# ============================================================
 
-
-async def run_trading_bot():
-    """Run bot"""
-    bot = NiftyOptionsBot()
-    await bot.run()
-
-
-# ======================== ENTRY POINT ========================
 if __name__ == "__main__":
     from aiohttp import web
-    
+
     app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    app.on_startup.append(start_bot_background)
-    
-    port = int(os.getenv('PORT', 8000))
-    
+    app.router.add_get("/",       health)
+    app.router.add_get("/health", health)
+    app.on_startup.append(start_bot)
+    app.on_cleanup.append(stop_bot)
+
+    port = int(os.getenv("PORT", 8000))
+
     print(f"""
-╔══════════════════════════════════════════════════════╗
-║   🚀 NIFTY OPTIONS BOT v5.1                         ║
-║   VOLUME + PCR + DETAILED LOGS!                     ║
-╚══════════════════════════════════════════════════════╝
-
-✅ NEW IN v5.1:
-  • Volume tracking per strike
-  • PCR trend analysis
-  • Detailed logs before AI
-  • Triple confirmation logic
-  • Volume-OI mismatch detection
-  • TRAP warning system
-
-⚡ FEATURES:
-  • Strike-wise OI + Volume
-  • ATM 3x weight
-  • Support/Resistance from OI
-  • Candlestick patterns
-  • DeepSeek 30s timeout
-  • False signal filtering
-
+╔══════════════════════════════════════════╗
+║   NIFTY 50 OPTIONS BOT v6.1 PRO          ║
+║   Platform: Koyeb | Upstox V2            ║
+╠══════════════════════════════════════════╣
+║  Asset    : NIFTY 50 Weekly Options      ║
+║  Lot Size : {LOT_SIZE} | Strike: ₹{STRIKE_INTERVAL}           ║
+║  ATM Range: ±{ATM_RANGE} strikes (±₹{ATM_RANGE*STRIKE_INTERVAL})       ║
+║  Polling  : Every {SNAPSHOT_INTERVAL//60} min                  ║
+╠══════════════════════════════════════════╣
+║  v6.1 FIXES:                             ║
+║  ✅ PHASE1 OI ≥ {PHASE1_OI_BUILD_PCT}% (was 4%)          ║
+║  ✅ PHASE2 Vol ≥ {PHASE2_VOL_SPIKE_PCT}% (was 20%)       ║
+║  ✅ MTF threshold = {MTF_OVERALL_THRESHOLD} (was 12)          ║
+║  ✅ Candle: 1min+5min+30min (2 API calls)║
+║  ✅ Expiry: daily refresh (not 30min)    ║
+╠══════════════════════════════════════════╣
+║  CANDLE DATA:                            ║
+║  1min  → Pandas resample → 5min          ║
+║  30min → Upstox direct (V2 supported)    ║
+║  5min+15min+30min OI → DualCache         ║
+╠══════════════════════════════════════════╣
+║  ENV VARS NEEDED:                        ║
+║  UPSTOX_ACCESS_TOKEN                     ║
+║  TELEGRAM_BOT_TOKEN                      ║
+║  TELEGRAM_CHAT_ID                        ║
+║  DEEPSEEK_API_KEY                        ║
+║  PORT (default: 8000)                    ║
+╚══════════════════════════════════════════╝
 Starting on port {port}...
-Bot running in background.
 """)
-    
-    web.run_app(app, host='0.0.0.0', port=port)
+
+    web.run_app(app, host="0.0.0.0", port=port)
