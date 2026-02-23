@@ -129,6 +129,8 @@ class OISnapshot:
     pe_ltp:    float
     ce_iv:     float
     pe_iv:     float
+    ce_delta:  float   # v6.4: Delta for strike selection
+    pe_delta:  float
     pcr:       float
     timestamp: datetime
 
@@ -145,6 +147,8 @@ class MarketSnapshot:
     total_pe_oi:  float
     total_ce_vol: float
     total_pe_vol: float
+    india_vix:    float = 0.0   # v6.4: India VIX
+    max_pain:     int   = 0     # v6.4: Max Pain strike
 
 
 @dataclass
@@ -226,6 +230,8 @@ class StrikeAnalysis:
     bear_strength:  float
     recommendation: str
     confidence:     float
+    ce_delta:       float = 0.0   # v6.4
+    pe_delta:       float = 0.0
 
 
 @dataclass
@@ -475,8 +481,16 @@ class UpstoxClient:
             pe_vol = float(pe.get("volume", 0) or 0)
             ce_ltp = float(ce.get("ltp",    0) or 0)
             pe_ltp = float(pe.get("ltp",    0) or 0)
-            ce_iv  = float(cg.get("iv",     0) or 0) * 100
-            pe_iv  = float(pg.get("iv",     0) or 0) * 100
+            # v6.4 FIX: Upstox returns IV as decimal (0.1675 = 16.75%)
+            # Multiply by 100 only once
+            ce_iv  = float(cg.get("iv", 0) or 0) * 100
+            pe_iv  = float(pg.get("iv", 0) or 0) * 100
+            # Safety clamp: IV > 200% is definitely a bug
+            ce_iv  = ce_iv if ce_iv <= 200.0 else ce_iv / 100.0
+            pe_iv  = pe_iv if pe_iv <= 200.0 else pe_iv / 100.0
+            # Delta
+            ce_delta = float(cg.get("delta", 0) or 0)
+            pe_delta = float(pg.get("delta", 0) or 0)
             pcr    = (pe_oi / ce_oi) if ce_oi > 0 else 0.0
 
             t_ce_oi  += ce_oi;  t_pe_oi  += pe_oi
@@ -486,24 +500,62 @@ class UpstoxClient:
                 strike=strike, ce_oi=ce_oi, pe_oi=pe_oi,
                 ce_volume=ce_vol, pe_volume=pe_vol,
                 ce_ltp=ce_ltp, pe_ltp=pe_ltp,
-                ce_iv=ce_iv, pe_iv=pe_iv, pcr=pcr,
-                timestamp=datetime.now(IST)
+                ce_iv=ce_iv, pe_iv=pe_iv,
+                ce_delta=ce_delta, pe_delta=pe_delta,
+                pcr=pcr, timestamp=datetime.now(IST)
             )
 
         if not strikes_oi:
             return None
 
         overall_pcr = (t_pe_oi / t_ce_oi) if t_ce_oi > 0 else 0.0
+
+        # v6.4: India VIX from index quote
+        india_vix = 0.0
+        try:
+            vix_data = await self._get(
+                f"{UPSTOX_BASE}/market-quote/quotes",
+                params={"instrument_key": "NSE_INDEX|India VIX"}
+            )
+            if vix_data and vix_data.get("status") == "success":
+                vix_d = vix_data.get("data", {})
+                # Key format: NSE_INDEX:India VIX
+                for k, v in vix_d.items():
+                    india_vix = float(v.get("last_price", 0) or 0)
+                    break
+        except Exception:
+            pass
+
+        # v6.4: Max Pain = strike with max total loss for option buyers
+        max_pain = atm  # default ATM
+        try:
+            min_pain = float("inf")
+            for test_strike in sorted(strikes_oi.keys()):
+                total_loss = 0.0
+                for s, snap in strikes_oi.items():
+                    # CE buyers lose if test_strike > strike
+                    if test_strike > s:
+                        total_loss += snap.ce_oi * (test_strike - s)
+                    # PE buyers lose if test_strike < strike
+                    if test_strike < s:
+                        total_loss += snap.pe_oi * (s - test_strike)
+                if total_loss < min_pain:
+                    min_pain  = total_loss
+                    max_pain  = test_strike
+        except Exception:
+            pass
+
         logger.info(
-            f"💰 NIFTY:{spot:,.2f} | ATM:{atm} | "
-            f"Strikes:{len(strikes_oi)} | PCR:{overall_pcr:.2f}"
+            f"💰 NIFTY:{spot:,.2f} | ATM:{atm} | PCR:{overall_pcr:.2f} | "
+            f"VIX:{india_vix:.2f} | MaxPain:{max_pain}"
         )
         return MarketSnapshot(
             timestamp=datetime.now(IST),
             spot_price=spot, atm_strike=atm, expiry=expiry,
             strikes_oi=strikes_oi, overall_pcr=overall_pcr,
             total_ce_oi=t_ce_oi, total_pe_oi=t_pe_oi,
-            total_ce_vol=t_ce_vol, total_pe_vol=t_pe_vol
+            total_ce_vol=t_ce_vol, total_pe_vol=t_pe_vol,
+            india_vix=india_vix, max_pain=max_pain
         )
 
 
@@ -776,7 +828,8 @@ class MTFAnalyzer:
                 mtf_confirmed=mtf, vol_confirms=vc, vol_strength=vs,
                 is_support=False, is_resistance=False,
                 bull_strength=bull, bear_strength=bear,
-                recommendation=rec, confidence=conf
+                recommendation=rec, confidence=conf,
+                ce_delta=c.ce_delta, pe_delta=c.pe_delta   # v6.4
             ))
 
         sr = self._find_sr(current, analyses)
@@ -1230,6 +1283,21 @@ class PromptBuilder:
         p  = "You are an expert NIFTY 50 options trader. Analyze everything and give precise signal.\n\n"
         p += f"=== MARKET | {now} | Expiry:{snap.expiry} | Lot:{LOT_SIZE} | Trigger:{trigger} ===\n"
         p += f"NIFTY: ₹{snap.spot_price:,.2f} | ATM:{snap.atm_strike} | PCR:{pcr:.2f}({oi['pcr_trend']} Δ{oi['pcr_ch_pct']:+.1f}%)\n"
+        p += f"India VIX:{snap.india_vix:.2f} | Max Pain:{snap.max_pain}\n"
+        # VIX interpretation for AI
+        if snap.india_vix > 0:
+            if snap.india_vix < 13:   p += "VIX LOW (<13): Options cheap → ATM or 1-ITM ok\n"
+            elif snap.india_vix < 18: p += "VIX NORMAL (13-18): Standard pricing\n"
+            elif snap.india_vix < 25: p += "VIX HIGH (18-25): Options expensive → ATM only\n"
+            else:                     p += "VIX VERY HIGH (>25): Extreme premium → avoid buying options\n"
+        # Max Pain vs Spot
+        mp_diff = snap.spot_price - snap.max_pain
+        if abs(mp_diff) <= 50:
+            p += f"Spot near Max Pain (diff:{mp_diff:+.0f}) → Sideways bias near expiry\n"
+        elif mp_diff > 50:
+            p += f"Spot ABOVE Max Pain by {mp_diff:.0f}pts → Gravity pull DOWN toward {snap.max_pain}\n"
+        else:
+            p += f"Spot BELOW Max Pain by {abs(mp_diff):.0f}pts → Gravity pull UP toward {snap.max_pain}\n"
         p += f"OI Support:{sr.support_strike} | OI Resistance:{sr.resistance_strike}\n"
         if sr.near_support:    p += "⚠️ NEAR OI SUPPORT!\n"
         if sr.near_resistance: p += "⚠️ NEAR OI RESISTANCE!\n"
@@ -1253,16 +1321,16 @@ class PromptBuilder:
         if pa.resistance_levels: p += f"Price resistance: {', '.join(f'₹{r:.0f}' for r in pa.resistance_levels)}\n"
 
         p += f"\n=== OI ANALYSIS (3-min + {oi['window_mins']}-min window) ===\n"
-        p += "STRIKE | W | CE_OI(3%/15%) | CE_VOL15% | CE_ACT | PE_OI(3%/15%) | PE_VOL15% | PE_ACT | PCR | TF3/TF15 | MTF | IV(CE/PE) | Bull | Bear\n"
+        p += "STRIKE|W|CE_OI(3/15%)|CE_VOL%|CE_ACT|CE_Δ|PE_OI(3/15%)|PE_VOL%|PE_ACT|PE_Δ|PCR|TF3/TF15|MTF|IV(CE/PE)|Bull|Bear\n"
         for sa in oi["strike_analyses"]:
             tag = "ATM" if sa.is_atm else ("SUP" if sa.is_support else ("RES" if sa.is_resistance else "   "))
             p += (
-                f"{sa.strike}({tag}) W{sa.weight:.0f} | "
-                f"CE:{sa.ce_oi_3:+.0f}%/{sa.ce_oi_15:+.0f}% V:{sa.ce_vol_15:+.0f}%({sa.ce_action}) | "
-                f"PE:{sa.pe_oi_3:+.0f}%/{sa.pe_oi_15:+.0f}% V:{sa.pe_vol_15:+.0f}%({sa.pe_action}) | "
-                f"PCR:{sa.pcr:.2f} | {sa.tf3_signal[:3]}/{sa.tf15_signal[:3]} | "
-                f"MTF:{'✅' if sa.mtf_confirmed else '❌'} | "
-                f"IV:{sa.ce_iv:.1f}%/{sa.pe_iv:.1f}% | "
+                f"{sa.strike}({tag}) W{sa.weight:.0f}|"
+                f"CE:{sa.ce_oi_3:+.0f}%/{sa.ce_oi_15:+.0f}% V:{sa.ce_vol_15:+.0f}%({sa.ce_action}) Δ{sa.ce_delta:.2f}|"
+                f"PE:{sa.pe_oi_3:+.0f}%/{sa.pe_oi_15:+.0f}% V:{sa.pe_vol_15:+.0f}%({sa.pe_action}) Δ{sa.pe_delta:.2f}|"
+                f"PCR:{sa.pcr:.2f}|{sa.tf3_signal[:3]}/{sa.tf15_signal[:3]}|"
+                f"MTF:{'✅' if sa.mtf_confirmed else '❌'}|"
+                f"IV:{sa.ce_iv:.1f}%/{sa.pe_iv:.1f}%|"
                 f"B:{sa.bull_strength:.0f} Br:{sa.bear_strength:.0f}\n"
             )
 
@@ -1278,16 +1346,20 @@ class PromptBuilder:
         if p_sup or p_res: p += f"\nCandle S/R: Sup=₹{p_sup:.0f} | Res=₹{p_res:.0f}\n"
 
         p += f"""
-=== NIFTY RULES ===
+=== NIFTY TRADING RULES ===
 OI: CALL OI↑+Vol↑=Resistance=BEARISH→BUY PUT | PUT OI↑+Vol↑=Support=BULLISH→BUY CALL
 OI↑ Vol flat = TRAP! | MTF(3+15 agree)=HIGH confidence
-STRONG OI (>20% in 15min): High probability directional move — DO NOT ignore
-TREND: Trade with day trend | All TFs+VWAP agree = best entry
-VWAP: Spot above=bullish bias | Spot below=bearish bias
+STRONG OI (>20% in 15min): High probability directional move
+DELTA: ATM=~0.50 | OTM=0.25-0.35 | ITM=0.65-0.80
+  → Delta 0.45-0.55 = best ATM entry | Delta <0.30 = risky OTM
+VIX: <13=cheap buy options | 13-18=normal | >20=expensive avoid buying
+MAX PAIN: Expiry gravity — price pulls toward max pain as expiry nears
+  → Spot far above Max Pain = bearish expiry bias
+  → Spot far below Max Pain = bullish expiry bias
 PCR>{PCR_BULL}=bullish | PCR<{PCR_BEAR}=bearish
-IV>20%=expensive, ATM only | IV<12%=cheap, ATM or 1-ITM
+TREND: Trade with day trend | VWAP above=bullish, below=bearish
 Lot={LOT_SIZE} | Strike=₹{STRIKE_INTERVAL} | SL=1 strike | Tgt=2 strikes
-Entry: MTF+Volume+Trend all confirm
+Entry: MTF+Volume+Trend+Delta all confirm
 
 RESPOND ONLY JSON:
 {{
@@ -1300,13 +1372,14 @@ RESPOND ONLY JSON:
   "mtf": {{"tf3": "", "tf15": "", "confirmed": true}},
   "price_action": {{"momentum": "", "triple_confirmed": true, "confirms_signal": true}},
   "candle_pattern": {{"pattern": "", "type": "", "confirms_signal": true, "near_sr": true}},
-  "atm": {{"ce_action": "", "pe_action": "", "vol_confirms": true, "strength": ""}},
-  "iv_note": {{"ce_iv": 0, "pe_iv": 0, "note": ""}},
+  "atm": {{"ce_action": "", "pe_action": "", "vol_confirms": true, "strength": "", "ce_delta": 0.0, "pe_delta": 0.0}},
+  "iv_note": {{"ce_iv": 0, "pe_iv": 0, "vix": {snap.india_vix:.2f}, "note": ""}},
+  "max_pain": {{"level": {snap.max_pain}, "spot_vs_mp": {int(snap.spot_price - snap.max_pain)}, "bias": ""}},
   "pcr": {{"value": {pcr:.2f}, "trend": "{oi['pcr_trend']}", "supports": true}},
   "volume": {{"ok": true, "spike_ratio": {pa.vol_spike_ratio:.2f}, "trap_warning": ""}},
   "entry": {{"now": true, "reason": "", "wait_for": ""}},
   "rr": {{"sl_pts": 0, "tgt_pts": 0, "ratio": 0}},
-  "levels": {{"oi_support": {sr.support_strike}, "oi_resistance": {sr.resistance_strike}, "candle_sup": {p_sup:.0f}, "candle_res": {p_res:.0f}}}
+  "levels": {{"oi_support": {sr.support_strike}, "oi_resistance": {sr.resistance_strike}, "candle_sup": {p_sup:.0f}, "candle_res": {p_res:.0f}, "max_pain": {snap.max_pain}}}
 }}"""
         return p
 
@@ -1395,14 +1468,26 @@ class TelegramAlerter:
         cndl = sig.get("candle_pattern", {})
         trnd = sig.get("trend_analysis", {})
         iv   = sig.get("iv_note",        {})
+        mp   = sig.get("max_pain",       {})
         st   = sig.get("signal", "WAIT")
         opt  = "CE" if "CALL" in st else "PE" if "PUT" in st else ""
         t    = pa.trend
         conf = sig.get("confidence", 0)
         bar  = "🟢" * min(conf, 10) + "⚪" * (10 - min(conf, 10))
 
+        # ATM strike Delta from OI data
+        atm_snap = snap.strikes_oi.get(snap.atm_strike)
+        ce_delta = atm_snap.ce_delta if atm_snap else 0.0
+        pe_delta = atm_snap.pe_delta if atm_snap else 0.0
+
+        # VIX label
+        vix = snap.india_vix
+        vix_label = ("🟢 Low" if vix < 13 else
+                     "🟡 Normal" if vix < 18 else
+                     "🔴 High" if vix < 25 else "🚨 Extreme")
+
         msg = (
-            f"🚀 NIFTY OPTIONS v6.3 | {trigger}\n"
+            f"🚀 NIFTY OPTIONS v6.4 | {trigger}\n"
             f"📅 {datetime.now(IST).strftime('%d-%b %H:%M IST')}\n\n"
             f"💰 NIFTY: ₹{snap.spot_price:,.2f}\n"
             f"📊 Signal: <b>{st}</b>\n"
@@ -1413,14 +1498,20 @@ class TelegramAlerter:
             f"SL: {sig.get('stop_loss_strike',0)} {opt} | "
             f"Target: {sig.get('target_strike',0)} {opt}\n"
             f"RR: {rr.get('ratio','N/A')} "
-            f"(SL:{rr.get('sl_pts',0)}pt→Tgt:{rr.get('tgt_pts',0)}pt)\n\n"
+            f"(SL:{rr.get('sl_pts',0)}pt → Tgt:{rr.get('tgt_pts',0)}pt)\n\n"
+            f"━━━ VIX & MAX PAIN ━━━\n"
+            f"VIX: {vix:.2f} {vix_label}\n"
+            f"Max Pain: {snap.max_pain} | "
+            f"Spot vs MP: {snap.spot_price - snap.max_pain:+.0f}pts\n"
+            f"MP Bias: {mp.get('bias','N/A')}\n\n"
             f"━━━ TREND ━━━\n"
             f"Day:{t.day_trend} | 3min:{t.intraday_trend}\n"
             f"VWAP:₹{t.vwap:.0f} | Spot {t.spot_vs_vwap}\n"
             f"All agree:{'✅' if trnd.get('all_agree') else '❌'} | "
             f"VWAP confirms:{'✅' if trnd.get('vwap_confirms') else '❌'}\n\n"
             f"━━━ OI (3m+15m) ━━━\n"
-            f"ATM CE:{atma.get('ce_action','N/A')} | ATM PE:{atma.get('pe_action','N/A')}\n"
+            f"ATM CE:{atma.get('ce_action','N/A')} Δ{ce_delta:.2f} | "
+            f"ATM PE:{atma.get('pe_action','N/A')} Δ{pe_delta:.2f}\n"
             f"TF3:{mtf.get('tf3','N/A')} | TF15:{mtf.get('tf15','N/A')}\n"
             f"MTF:{'✅ HIGH CONF' if mtf.get('confirmed') else '❌ Weak'} | "
             f"Vol:{'✅' if atma.get('vol_confirms') else '❌ TRAP?'}\n\n"
@@ -1433,15 +1524,158 @@ class TelegramAlerter:
             f"Confirms:{'✅' if cndl.get('confirms_signal') else '❌'}\n"
             f"PCR:{pcra.get('value','N/A')} ({pcra.get('trend','N/A')}) | "
             f"Supports:{'✅' if pcra.get('supports') else '❌'}\n"
-            f"IV: CE={iv.get('ce_iv',0):.1f}% PE={iv.get('pe_iv',0):.1f}%\n\n"
+            f"IV: CE={iv.get('ce_iv',0):.1f}% PE={iv.get('pe_iv',0):.1f}% "
+            f"| {iv.get('note','')}\n\n"
             f"━━━ ENTRY ━━━\n"
             f"{'✅ ENTER NOW' if ent.get('now') else '⏳ WAIT'}\n"
             f"{ent.get('reason','')}\n\n"
-            f"DeepSeek V3 | NIFTY v6.3 | 3-min polling"
+            f"DeepSeek V3 | NIFTY v6.4 | 3-min polling"
         )
         if vol.get("trap_warning"):
             msg += f"\n\n⚠️ {vol['trap_warning']}"
         await self.send_raw(msg.strip())
+
+
+# ============================================================
+#  EXIT TRACKER — v6.4 NEW
+# ============================================================
+
+@dataclass
+class ActiveTrade:
+    signal:        str    # BUY_CALL or BUY_PUT
+    entry_strike:  int
+    sl_strike:     int
+    target_strike: int
+    entry_price:   float  # spot at entry
+    entry_ltp:     float  # option LTP at entry
+    entry_time:    datetime
+    trigger:       str
+    confidence:    int
+    opt_type:      str    # CE or PE
+
+
+class ExitTracker:
+    """
+    v6.4 NEW: Tracks active trade and fires exit alerts.
+    Monitors every cycle:
+    - Target hit → EXIT profit alert
+    - SL hit     → EXIT loss alert
+    - OI reversal (30-min) → EXIT warning
+    - Market close (15:20) → Exit reminder
+    """
+
+    def __init__(self, alerter):
+        self.alerter      = alerter
+        self.active_trade: Optional[ActiveTrade] = None
+
+    def set_trade(self, sig: Dict, snap: MarketSnapshot, trigger: str):
+        st = sig.get("signal", "WAIT")
+        if st == "WAIT":
+            return
+        opt = "CE" if "CALL" in st else "PE"
+        entry_strike = sig.get("primary_strike", snap.atm_strike)
+        atm_s = snap.strikes_oi.get(entry_strike) or snap.strikes_oi.get(snap.atm_strike)
+        entry_ltp = (atm_s.ce_ltp if opt == "CE" else atm_s.pe_ltp) if atm_s else 0.0
+
+        self.active_trade = ActiveTrade(
+            signal=st,
+            entry_strike=entry_strike,
+            sl_strike=sig.get("stop_loss_strike", 0),
+            target_strike=sig.get("target_strike", 0),
+            entry_price=snap.spot_price,
+            entry_ltp=entry_ltp,
+            entry_time=datetime.now(IST),
+            trigger=trigger,
+            confidence=sig.get("confidence", 0),
+            opt_type=opt
+        )
+        logger.info(
+            f"📌 Trade set: {st} | Strike:{entry_strike} | "
+            f"LTP:{entry_ltp:.2f} | SL:{sig.get('stop_loss_strike')} | "
+            f"Tgt:{sig.get('target_strike')}"
+        )
+
+    def has_trade(self) -> bool:
+        return self.active_trade is not None
+
+    def clear_trade(self):
+        self.active_trade = None
+
+    async def check_exit(self, snap: MarketSnapshot, pa: PriceActionInsight):
+        """Called every cycle to check exit conditions."""
+        t = self.active_trade
+        if not t:
+            return
+
+        spot      = snap.spot_price
+        now       = datetime.now(IST)
+        duration  = int((now - t.entry_time).total_seconds() / 60)
+        atm_s     = snap.strikes_oi.get(t.entry_strike) or snap.strikes_oi.get(snap.atm_strike)
+        curr_ltp  = (atm_s.ce_ltp if t.opt_type == "CE" else atm_s.pe_ltp) if atm_s else 0.0
+        pnl_pts   = curr_ltp - t.entry_ltp if t.entry_ltp > 0 else 0.0
+        pnl_pct   = (pnl_pts / t.entry_ltp * 100) if t.entry_ltp > 0 else 0.0
+
+        reason = None
+        emoji  = ""
+
+        # 1. Target hit — spot crossed target strike
+        if t.target_strike:
+            if t.signal == "BUY_CALL" and spot >= t.target_strike:
+                reason = f"🎯 TARGET HIT! Spot {spot:,.0f} ≥ Target {t.target_strike}"
+                emoji  = "✅"
+            elif t.signal == "BUY_PUT" and spot <= t.target_strike:
+                reason = f"🎯 TARGET HIT! Spot {spot:,.0f} ≤ Target {t.target_strike}"
+                emoji  = "✅"
+
+        # 2. SL hit — spot crossed SL strike
+        if not reason and t.sl_strike:
+            if t.signal == "BUY_CALL" and spot <= t.sl_strike:
+                reason = f"🛑 STOP LOSS HIT! Spot {spot:,.0f} ≤ SL {t.sl_strike}"
+                emoji  = "❌"
+            elif t.signal == "BUY_PUT" and spot >= t.sl_strike:
+                reason = f"🛑 STOP LOSS HIT! Spot {spot:,.0f} ≥ SL {t.sl_strike}"
+                emoji  = "❌"
+
+        # 3. OI reversal — direction changed
+        if not reason:
+            if (t.signal == "BUY_CALL" and pa.price_momentum == "BEARISH"
+                    and pa.price_change_15m < -0.4):
+                reason = f"⚠️ TREND REVERSAL! Price {pa.price_change_15m:+.2f}% in 15m"
+                emoji  = "⚠️"
+            elif (t.signal == "BUY_PUT" and pa.price_momentum == "BULLISH"
+                    and pa.price_change_15m > 0.4):
+                reason = f"⚠️ TREND REVERSAL! Price {pa.price_change_15m:+.2f}% in 15m"
+                emoji  = "⚠️"
+
+        # 4. Market close reminder
+        if not reason and now.hour == 15 and now.minute >= 20:
+            reason = "🔔 Market closing in 10 min — review position"
+            emoji  = "🔔"
+
+        if reason:
+            await self._send_exit(t, snap, curr_ltp, pnl_pts, pnl_pct, duration, reason, emoji)
+            if emoji in ("✅", "❌"):  # hard exit — clear trade
+                self.clear_trade()
+
+    async def _send_exit(self, t: ActiveTrade, snap: MarketSnapshot,
+                         curr_ltp: float, pnl_pts: float, pnl_pct: float,
+                         duration: int, reason: str, emoji: str):
+        pnl_total = pnl_pts * LOT_SIZE
+        msg = (
+            f"{emoji} EXIT ALERT | NIFTY v6.4\n"
+            f"📅 {datetime.now(IST).strftime('%d-%b %H:%M IST')}\n\n"
+            f"Trade: {t.signal} | {t.entry_strike} {t.opt_type}\n"
+            f"Entry: ₹{t.entry_ltp:.2f} → Current: ₹{curr_ltp:.2f}\n"
+            f"P&L: {pnl_pts:+.2f}pts ({pnl_pct:+.1f}%) | "
+            f"Total: ₹{pnl_total:+.0f}\n"
+            f"Duration: {duration} min\n\n"
+            f"Spot: ₹{snap.spot_price:,.2f}\n"
+            f"SL: {t.sl_strike} | Target: {t.target_strike}\n\n"
+            f"{reason}\n\n"
+            f"Entry trigger: {t.trigger} | Conf:{t.confidence}/10"
+        )
+        await self.alerter.send_raw(msg)
+        logger.info(f"🚪 EXIT: {reason} | P&L:{pnl_pts:+.2f}pts")
 
 
 # ============================================================
@@ -1459,6 +1693,7 @@ class NiftyOptionsBot:
         self.checker = AlertChecker(self.cache, self.alerter)
         self.phase   = PhaseDetector()
         self.strong  = StrongOIChecker()
+        self.exit_tr = ExitTracker(self.alerter)   # v6.4: exit tracker
         self._cycle  = 0
         self._expiry: Optional[str] = None
         self._expiry_date: Optional[str] = None
@@ -1480,7 +1715,7 @@ class NiftyOptionsBot:
 
     async def run(self):
         logger.info("=" * 60)
-        logger.info("NIFTY OPTIONS BOT v6.3 PRO — Koyeb")
+        logger.info("NIFTY OPTIONS BOT v6.4 PRO — Koyeb")
         logger.info(f"Polling: {SNAPSHOT_INTERVAL}s | ATM±{ATM_RANGE} | Lot:{LOT_SIZE}")
         logger.info(f"Strong OI threshold: >{STRONG_OI_DIRECT_PCT}% OI + >{STRONG_VOL_PCT}% Vol")
         logger.info(f"Phase1≥{PHASE1_OI_BUILD_PCT}% | Phase2≥{PHASE2_VOL_SPIKE_PCT}%")
@@ -1519,7 +1754,7 @@ class NiftyOptionsBot:
 
     async def _cycle_run(self):
         self._cycle += 1
-        is_analysis = (self._cycle % ANALYSIS_EVERY_N == 0)  # every 15-min
+        is_analysis = (self._cycle % ANALYSIS_EVERY_N == 0)
 
         await self._refresh_expiry()
         if not self._expiry:
@@ -1529,6 +1764,7 @@ class NiftyOptionsBot:
         logger.info(
             f"{'📊 ANALYSIS' if is_analysis else '📦 SNAP'} "
             f"#{self._cycle} | {datetime.now(IST).strftime('%H:%M:%S IST')}"
+            + (f" | 📌 TRADE ACTIVE" if self.exit_tr.has_trade() else "")
         )
 
         # 1. Option chain snapshot
@@ -1544,37 +1780,40 @@ class NiftyOptionsBot:
         # 3. Candle data (2 API calls)
         df_1m, df_3m, df_30m = await self.upstox.get_candles()
 
-        # 4. Price action (uses option chain volume for VWAP)
+        # 4. Price action
         recent = await self.cache.get_recent(20)
         pa     = PriceActionCalculator.calculate(recent, df_3m, df_30m)
         logger.info(
             f"Price: 3m={pa.price_change_3m:+.2f}% 15m={pa.price_change_15m:+.2f}% | "
             f"Vol:{pa.vol_spike_ratio:.2f}x | VWAP:₹{pa.trend.vwap:.0f} | "
-            f"Spot {pa.trend.spot_vs_vwap}"
+            f"VIX:{snap.india_vix:.1f} | MaxPain:{snap.max_pain}"
         )
 
-        # 5. Strong OI → direct AI (most important, no phase wait)
+        # 5. Exit check — HIGHEST PRIORITY if trade active
+        if self.exit_tr.has_trade():
+            await self.exit_tr.check_exit(snap, pa)
+
+        # 6. Strong OI → direct AI
         prev_15, _ = await self.cache.get_best_prev()
         strong_ev  = await self.strong.check(snap, prev_15, pa)
-        if strong_ev:
+        if strong_ev and not self.exit_tr.has_trade():
             await self._strong_oi_ai_call(snap, pa, strong_ev, df_3m, df_30m)
 
-        # 6. Phase detection (parallel system)
+        # 7. Phase detection
         prev_3 = await self.cache.get_short()
         phases = await self.phase.detect(snap, prev_3, pa)
         for ps in phases:
             logger.info(f"⚡ Phase {ps.phase}: {ps.direction}")
             await self.alerter.send_raw(ps.message)
-            if ps.phase == 3:
+            if ps.phase == 3 and not self.exit_tr.has_trade():
                 await self._phase3_ai_call(snap, pa, ps, df_3m, df_30m)
 
-        # 7. Periodic MTF analysis (every 15-min)
-        if is_analysis:
+        # 8. Periodic MTF analysis (every 15-min)
+        if is_analysis and not self.exit_tr.has_trade():
             await self._full_analysis(snap, pa, df_3m, df_30m)
 
     async def _strong_oi_ai_call(self, snap: MarketSnapshot, pa: PriceActionInsight,
                                   strong_ev: Dict, df_3m: pd.DataFrame, df_30m: pd.DataFrame):
-        """v6.3 NEW: Direct AI call on strong OI — no phase wait."""
         logger.info("🔥 Strong OI → DeepSeek V3...")
         oi = await self.mtf.analyze(snap)
         if not oi["available"]:
@@ -1589,6 +1828,7 @@ class NiftyOptionsBot:
         ai_sig = await self.ai.analyze(prompt)
         if ai_sig and ai_sig.get("confidence", 0) >= MIN_CONFIDENCE:
             await self.alerter.send_signal(ai_sig, snap, oi, pa, trigger="🔥 STRONG_OI")
+            self.exit_tr.set_trade(ai_sig, snap, "STRONG_OI")  # v6.4: track trade
 
     async def _phase3_ai_call(self, snap: MarketSnapshot, pa: PriceActionInsight,
                                ps: PhaseSignal, df_3m: pd.DataFrame, df_30m: pd.DataFrame):
@@ -1606,6 +1846,7 @@ class NiftyOptionsBot:
         ai_sig = await self.ai.analyze(prompt)
         if ai_sig and ai_sig.get("confidence", 0) >= MIN_CONFIDENCE:
             await self.alerter.send_signal(ai_sig, snap, oi, pa, trigger="🚀 PHASE3")
+            self.exit_tr.set_trade(ai_sig, snap, "PHASE3")  # v6.4: track trade
 
     async def _full_analysis(self, snap: MarketSnapshot, pa: PriceActionInsight,
                               df_3m: pd.DataFrame, df_30m: pd.DataFrame):
@@ -1635,6 +1876,7 @@ class NiftyOptionsBot:
         logger.info(f"Signal:{ai_sig.get('signal','WAIT')} | Conf:{conf}/10")
         if conf >= MIN_CONFIDENCE:
             await self.alerter.send_signal(ai_sig, snap, oi, pa, trigger="📊 MTF_15MIN")
+            self.exit_tr.set_trade(ai_sig, snap, "MTF_15MIN")  # v6.4: track trade
 
     def _fallback_oi(self, snap: MarketSnapshot, direction: str) -> Dict:
         return {
